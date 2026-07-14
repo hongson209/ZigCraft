@@ -1,4 +1,5 @@
--- SON HUB V3.5 - WindUI Version
+-- SON HUB V4 - WindUI Version
+-- Single-file Auto Spawn / Auto Bring build
 -- Created by SonDepTrai
 
 local WindUI
@@ -28,12 +29,13 @@ local VirtualUser = game:GetService("VirtualUser")
 local Workspace = game:GetService("Workspace")
 local TweenService = game:GetService("TweenService")
 local Player = Players.LocalPlayer
+local TeleportService = game:GetService("TeleportService")
+local GuiService = game:GetService("GuiService")
 
 local isMobile = UserInputService.TouchEnabled
 local screenSize = workspace.CurrentCamera.ViewportSize
 local isSmallScreen = screenSize.X < 800 or screenSize.Y < 600 or isMobile
 
--- Variables
 local FarmEnabled = false
 local ChestEnabled = false
 local SelectedWeapon = nil
@@ -56,21 +58,58 @@ local ESPEnabled = false
 local ESPFolder = nil
 local ESPConnection = nil
 local menuVisible = true
+local AutoHakiEnabled = false
+local TweenSpeed = 1.0
 
 local AutoSkillEnabled = false
 local SelectedSkills = {}
-local AvailableSkills = {"Z", "X", "C", "V", "B", "N", "F", "L", "H", "J", "K", "G"}
+local AvailableSkills = {"Z", "X", "C", "V", "B", "N", "Y", "G", "H", "J", "K", "L", "Q", "T", "F", "U", "P", "E", "R"}
 
 local AutoBringNormalFruit = false
 local AutoBringDemonFruit = false
 
+-- Auto Spawn / area farm state
+local AutoSpawnEnabled = false
+local AutoTeleportToSpawn = true
+local AutoBringMobs = false
+local AutoSelectNearestSpawn = false
+local SelectedSpawnLabel = "None"
+local SelectedSpawn = nil
+local SpawnTargetFilter = "Selected NPC"
+local SpawnScanRadius = 220
+local SpawnClusterDistance = 160
+local BringStackRadius = 5
+local BringHeight = 0
+local BringAnchorMode = "Spawn Center"
+local BringPattern = "Circle"
+local FreezeBroughtNPCs = true
+local MaxBringMobs = 10
+local BringInterval = 0.25
+local FarmTickInterval = 0.08
+local FarmDistance = 4
+local SpawnRegistry = {}
+local SpawnSerialByName = {}
+local BroughtNPCs = setmetatable({}, { __mode = "k" })
+local SpawnDropdown = nil
+local AutoSpawnToggleObject = nil
+local LastTeleportedSpawnLabel = nil
+local LastSpawnRefresh = 0
+local LastBringAt = 0
+local MissingSpawnNotified = false
+
 local NormalFruitNames = {
     ["apple"]=true, ["banana"]=true, ["greenapple"]=true,
     ["melon"]=true, ["pumpkin"]=true,
-    ["cantaloupe"]=true, ["coconut"]=true, ["prickly pear"]=true
+    ["cantaloupe"]=true, ["prickly pear"]=true
 }
 
 local RAYLEIGH_POSITION = Vector3.new(-1009.7536010742188, 4011.46484375, 10135.1171875)
+local SHOP_EMOTES_POSITION = Vector3.new(1514.7469482421875, 260.38421630859375, 2163.8037109375)
+
+local OldBookCollected = false
+local AutoChestForOldBook = false
+local IsSearchingOldBook = false
+local OldBookMonitoringEnabled = false
 
 local hardcoreMobs = {
     ["Lv2000 Crocodile"] = true, ["Lv20000 Whitebeard"] = true,
@@ -111,7 +150,14 @@ local FruitNames = {
     "Chilly Fruit", "Candy Fruit", "Bomb Fruit", "Buddha Fruit"
 }
 
--- Helper Functions
+--[[
+    SECURITY NOTE
+    Anti-cheat and exploit detection must run on the server. The previous block
+    replaced globals such as pcall/task/getgc and attempted to mutate Roblox
+    objects, which can break the entire client script. It has intentionally been
+    removed from this Studio version.
+]]
+
 local function getCharacter()
     return Player.Character or Player.CharacterAdded:Wait()
 end
@@ -185,7 +231,52 @@ local function equipWeapon(toolName)
     return tool.Parent == char
 end
 
--- Auto equip loop
+local function tweenToPosition(position, offset, silent)
+    silent = silent or false
+    offset = offset or Vector3.new(0, 3, 0)
+    local char = getCharacter()
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return false end
+    
+    hrp:SetAttribute("AllowTeleport", true)
+    
+    local targetCFrame = CFrame.new(position + offset)
+    local distance = (hrp.Position - targetCFrame.Position).Magnitude
+    local baseDuration = math.min(0.3 + (distance / 1000), 2.5)
+    local duration = baseDuration / TweenSpeed
+    
+    local tweenInfo = TweenInfo.new(
+        duration,
+        Enum.EasingStyle.Quad,
+        Enum.EasingDirection.Out
+    )
+    
+    local tween = TweenService:Create(hrp, tweenInfo, {CFrame = targetCFrame})
+    
+    local completed = false
+    tween.Completed:Connect(function()
+        completed = true
+        hrp:SetAttribute("AllowTeleport", false)
+    end)
+    
+    tween:Play()
+    
+    local timeout = duration + 0.5
+    local start = tick()
+    while not completed and tick() - start < timeout do
+        task.wait(0.05)
+    end
+    
+    if not completed then
+        hrp:SetAttribute("AllowTeleport", false)
+        pcall(function()
+            hrp.CFrame = targetCFrame
+        end)
+    end
+    
+    return true
+end
+
 task.spawn(function()
     while task.wait(0.5) do
         if ForceEquip and SelectedWeapon then
@@ -200,7 +291,6 @@ task.spawn(function()
     end
 end)
 
--- Auto skill loop
 task.spawn(function()
     local function pressKey(key)
         local keyCode = Enum.KeyCode[key]
@@ -240,7 +330,6 @@ task.spawn(function()
     end
 end)
 
--- Auto Haki loop
 task.spawn(function()
     while true do
         task.wait(2)
@@ -259,7 +348,6 @@ task.spawn(function()
     end
 end)
 
--- Auto bring loops
 task.spawn(function()
     while true do
         task.wait(0.7)
@@ -267,18 +355,30 @@ task.spawn(function()
         local char = getCharacter()
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
         if not hrp then continue end
+        
         for _, v in pairs(workspace:GetDescendants()) do
             if not v then continue end
             local name = v.Name
             if type(name) ~= "string" then continue end
-            if NormalFruitNames[string.lower(name)] then
+            local lowerName = string.lower(name)
+            if lowerName == "coconut" then continue end
+            if NormalFruitNames[lowerName] then
                 local part = v:FindFirstChildWhichIsA("BasePart")
                 if not part and v:IsA("BasePart") then
                     part = v
                 end
                 if part then
                     pcall(function()
-                        part.CFrame = hrp.CFrame * CFrame.new(0, -2.5, 0)
+                        local isHeld = false
+                        for _, plr in pairs(Players:GetPlayers()) do
+                            if plr.Character and plr.Character:FindFirstChild(v.Name) then
+                                isHeld = true
+                                break
+                            end
+                        end
+                        if not isHeld then
+                            part.CFrame = hrp.CFrame * CFrame.new(0, -2.5, 0)
+                        end
                     end)
                 end
             end
@@ -293,10 +393,21 @@ task.spawn(function()
         local char = getCharacter()
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
         if not hrp then continue end
+        
         for _, obj in pairs(Workspace:GetChildren()) do
             if not obj or not obj:IsA("Tool") then continue end
             local name = obj.Name
             if type(name) ~= "string" then continue end
+            
+            local isHeld = false
+            for _, plr in pairs(Players:GetPlayers()) do
+                if plr.Character and plr.Character:FindFirstChild(name) then
+                    isHeld = true
+                    break
+                end
+            end
+            if isHeld then continue end
+            
             for _, fn in ipairs(FruitNames) do
                 if name == fn then
                     local part = obj:FindFirstChildWhichIsA("BasePart")
@@ -322,12 +433,22 @@ task.spawn(function()
         local char = getCharacter()
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
         if not hrp then continue end
+        
         for _, obj in pairs(Workspace:GetDescendants()) do
             if not obj then continue end
             local name = obj.Name
             if type(name) ~= "string" then continue end
             local lowerName = string.lower(name)
             if lowerName == "oldbook" or lowerName == "old book" or string.find(lowerName, "oldbook") then
+                local isHeld = false
+                for _, plr in pairs(Players:GetPlayers()) do
+                    if plr.Character and plr.Character:FindFirstChild(obj.Name) then
+                        isHeld = true
+                        break
+                    end
+                end
+                if isHeld then continue end
+                
                 local part = obj:FindFirstChildWhichIsA("BasePart")
                 if not part and obj:IsA("BasePart") then
                     part = obj
@@ -349,12 +470,22 @@ task.spawn(function()
         local char = getCharacter()
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
         if not hrp then continue end
+        
         for _, obj in pairs(Workspace:GetDescendants()) do
             if not obj then continue end
             local name = obj.Name
             if type(name) ~= "string" then continue end
             local lowerName = string.lower(name)
             if lowerName == "compass" or string.find(lowerName, "compass") then
+                local isHeld = false
+                for _, plr in pairs(Players:GetPlayers()) do
+                    if plr.Character and plr.Character:FindFirstChild(obj.Name) then
+                        isHeld = true
+                        break
+                    end
+                end
+                if isHeld then continue end
+                
                 local part = obj:FindFirstChildWhichIsA("BasePart")
                 if not part and obj:IsA("BasePart") then
                     part = obj
@@ -369,146 +500,637 @@ task.spawn(function()
     end
 end)
 
--- Farm functions
-local function findMob()
-    local aliveFolder = workspace:FindFirstChild("Alive")
-    if not aliveFolder then return nil, nil, nil end
-    local bestMob, bestHum, bestRoot = nil, nil, nil
-    local lowestLevel = math.huge
-    local bestDistance = math.huge
-    local myChar = getCharacter()
-    local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
-    if not myRoot then return nil, nil, nil end
-    for _, npc in ipairs(aliveFolder:GetChildren()) do
-        if not npc or not npc:IsA("Model") then continue end
-        if Players:GetPlayerFromCharacter(npc) then continue end
-        if not IsValidMobForMode(npc.Name) then continue end
-        local level = getLevelFromName(npc.Name)
-        local hum = npc:FindFirstChildOfClass("Humanoid")
-        local root = npc:FindFirstChild("HumanoidRootPart") or npc:FindFirstChild("Head")
-        if hum and root and hum.Health > 0 then
-            local dist = (myRoot.Position - root.Position).Magnitude
-            if level < lowestLevel or (level == lowestLevel and dist < bestDistance) then
-                lowestLevel = level
-                bestDistance = dist
-                bestMob, bestHum, bestRoot = npc, hum, root
+local function checkOldBookInWorkspace()
+    for _, obj in pairs(Workspace:GetDescendants()) do
+        if not obj then continue end
+        local name = obj.Name
+        if type(name) ~= "string" then continue end
+        local lowerName = string.lower(name)
+        if lowerName == "oldbook" or lowerName == "old book" or string.find(lowerName, "oldbook") then
+            local isHeld = false
+            for _, plr in pairs(Players:GetPlayers()) do
+                if plr.Character and plr.Character:FindFirstChild(obj.Name) then
+                    isHeld = true
+                    break
+                end
+            end
+            if not isHeld then
+                return true
             end
         end
     end
-    return bestMob, bestHum, bestRoot
+    return false
+end
+
+local function checkOldBookInInventory()
+    local backpack = Player:FindFirstChild("Backpack")
+    if backpack then
+        for _, obj in pairs(backpack:GetChildren()) do
+            if obj:IsA("Tool") then
+                local name = obj.Name
+                if type(name) ~= "string" then continue end
+                local lowerName = string.lower(name)
+                if lowerName == "oldbook" or lowerName == "old book" or string.find(lowerName, "oldbook") then
+                    return true
+                end
+            end
+        end
+    end
+    local char = getCharacter()
+    if char then
+        for _, obj in pairs(char:GetChildren()) do
+            if obj:IsA("Tool") then
+                local name = obj.Name
+                if type(name) ~= "string" then continue end
+                local lowerName = string.lower(name)
+                if lowerName == "oldbook" or lowerName == "old book" or string.find(lowerName, "oldbook") then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        
+        if not AutoBringOldBook then 
+            if OldBookMonitoringEnabled then
+                OldBookMonitoringEnabled = false
+                if AutoChestForOldBook then
+                    ChestEnabled = false
+                    AutoChestForOldBook = false
+                end
+            end
+            continue 
+        end
+        
+        OldBookMonitoringEnabled = true
+        
+        if checkOldBookInInventory() then
+            if AutoChestForOldBook then
+                ChestEnabled = false
+                AutoChestForOldBook = false
+            end
+            if HakiQuestEnabled then
+                tweenToPosition(RAYLEIGH_POSITION, nil, true)
+                HakiQuestEnabled = false
+                WindUI:Notify({ Title = "OldBook", Content = "Found! Teleported to Rayleigh", Duration = 2 })
+            end
+            continue
+        end
+        
+        if checkOldBookInWorkspace() then
+            continue
+        else
+            if not ChestEnabled and not AutoChestForOldBook then
+                ChestEnabled = true
+                AutoChestForOldBook = true
+                WindUI:Notify({ Title = "OldBook", Content = "No OldBook found! Auto Chest enabled", Duration = 2 })
+            end
+        end
+    end
+end)
+
+local function getAliveFolder()
+    return Workspace:FindFirstChild("Alive")
+end
+
+local function getNPCParts(model)
+    if not model or not model:IsA("Model") then return nil, nil end
+    local humanoid = model:FindFirstChildOfClass("Humanoid")
+    local root = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Head")
+    return humanoid, root
+end
+
+local function isPlayerCharacter(model)
+    if not model or not model:IsA("Model") then return false end
+    if model == Player.Character then return true end
+    return Players:GetPlayerFromCharacter(model) ~= nil
+end
+
+local function isAliveNPC(model)
+    if not model or not model:IsA("Model") then return false end
+    if isPlayerCharacter(model) then return false end
+
+    local humanoid, root = getNPCParts(model)
+    return humanoid ~= nil and root ~= nil and humanoid.Health > 0
+end
+
+local function getPlayerRoot()
+    local character = Player.Character
+    return character and character:FindFirstChild("HumanoidRootPart")
+end
+
+local function roundPosition(position, step)
+    step = step or 10
+    return Vector3.new(
+        math.floor(position.X / step + 0.5) * step,
+        math.floor(position.Y / step + 0.5) * step,
+        math.floor(position.Z / step + 0.5) * step
+    )
+end
+
+local function buildLiveClusters()
+    local alive = getAliveFolder()
+    if not alive then return {} end
+
+    local clusters = {}
+    for _, npc in ipairs(alive:GetChildren()) do
+        if not isAliveNPC(npc) then continue end
+
+        local _, root = getNPCParts(npc)
+        local selectedCluster = nil
+
+        for _, cluster in ipairs(clusters) do
+            if cluster.MobName == npc.Name
+                and (cluster.Center - root.Position).Magnitude <= SpawnClusterDistance then
+                selectedCluster = cluster
+                break
+            end
+        end
+
+        if selectedCluster then
+            selectedCluster.Count += 1
+            selectedCluster.Center = selectedCluster.Center:Lerp(root.Position, 1 / selectedCluster.Count)
+        else
+            table.insert(clusters, {
+                MobName = npc.Name,
+                Center = root.Position,
+                Count = 1,
+            })
+        end
+    end
+
+    table.sort(clusters, function(a, b)
+        if a.MobName == b.MobName then
+            if math.abs(a.Center.X - b.Center.X) > 1 then
+                return a.Center.X < b.Center.X
+            end
+            return a.Center.Z < b.Center.Z
+        end
+        return a.MobName < b.MobName
+    end)
+
+    return clusters
+end
+
+local function mergeSpawnRegistry(liveClusters)
+    for _, entry in pairs(SpawnRegistry) do
+        entry.LiveCount = 0
+        entry.SeenThisScan = false
+    end
+
+    for _, cluster in ipairs(liveClusters) do
+        local bestEntry = nil
+        local bestDistance = math.huge
+
+        for _, entry in pairs(SpawnRegistry) do
+            if entry.MobName == cluster.MobName then
+                local distance = (entry.Center - cluster.Center).Magnitude
+                if distance <= math.max(SpawnClusterDistance, 100) and distance < bestDistance then
+                    bestEntry = entry
+                    bestDistance = distance
+                end
+            end
+        end
+
+        if bestEntry then
+            bestEntry.Center = bestEntry.Center:Lerp(cluster.Center, 0.35)
+            bestEntry.LiveCount = cluster.Count
+            bestEntry.SeenThisScan = true
+            bestEntry.MissedScans = 0
+        else
+            local serial = (SpawnSerialByName[cluster.MobName] or 0) + 1
+            SpawnSerialByName[cluster.MobName] = serial
+
+            local label = string.format("%s | Spawn %d", cluster.MobName, serial)
+            SpawnRegistry[label] = {
+                Label = label,
+                MobName = cluster.MobName,
+                Center = roundPosition(cluster.Center, 5),
+                LiveCount = cluster.Count,
+                SeenThisScan = true,
+                MissedScans = 0,
+            }
+        end
+    end
+
+    for label, entry in pairs(SpawnRegistry) do
+        if not entry.SeenThisScan then
+            entry.MissedScans = (entry.MissedScans or 0) + 1
+            if entry.MissedScans >= 5 then
+                SpawnRegistry[label] = nil
+            end
+        end
+    end
+end
+
+local function getSpawnLabels()
+    local labels = { "None" }
+    for label in pairs(SpawnRegistry) do
+        table.insert(labels, label)
+    end
+    table.sort(labels, function(a, b)
+        if a == "None" then return b ~= "None" end
+        if b == "None" then return false end
+        return a < b
+    end)
+    return labels
+end
+
+local function selectNearestSpawn()
+    local playerRoot = getPlayerRoot()
+    if not playerRoot then return nil end
+
+    local nearestLabel = nil
+    local nearestDistance = math.huge
+    for label, entry in pairs(SpawnRegistry) do
+        local distance = (entry.Center - playerRoot.Position).Magnitude
+        if distance < nearestDistance then
+            nearestLabel = label
+            nearestDistance = distance
+        end
+    end
+
+    if nearestLabel then
+        SelectedSpawnLabel = nearestLabel
+        SelectedSpawn = SpawnRegistry[nearestLabel]
+        if SpawnDropdown then
+            pcall(function() SpawnDropdown:Select(nearestLabel) end)
+        end
+    end
+
+    return nearestLabel
+end
+
+local function refreshSpawnList(showNotification)
+    mergeSpawnRegistry(buildLiveClusters())
+    local labels = getSpawnLabels()
+
+    if SpawnDropdown then
+        pcall(function()
+            SpawnDropdown:Refresh(labels)
+        end)
+    end
+
+    if SelectedSpawnLabel ~= "None" and SpawnRegistry[SelectedSpawnLabel] then
+        SelectedSpawn = SpawnRegistry[SelectedSpawnLabel]
+        if SpawnDropdown then
+            pcall(function() SpawnDropdown:Select(SelectedSpawnLabel) end)
+        end
+    elseif AutoSelectNearestSpawn then
+        selectNearestSpawn()
+    else
+        SelectedSpawnLabel = "None"
+        SelectedSpawn = nil
+    end
+
+    LastSpawnRefresh = os.clock()
+
+    if showNotification then
+        WindUI:Notify({
+            Title = "Spawn Scanner",
+            Content = string.format("Found %d spawn area(s)", math.max(#labels - 1, 0)),
+            Duration = 2,
+        })
+    end
+end
+
+local function getSelectedSpawnNPCs()
+    local result = {}
+    local spawn = SelectedSpawn
+    local alive = getAliveFolder()
+    if not spawn or not alive then return result end
+
+    for _, npc in ipairs(alive:GetChildren()) do
+        if not isAliveNPC(npc) then continue end
+
+        local _, root = getNPCParts(npc)
+        local distanceToSpawn = (root.Position - spawn.Center).Magnitude
+        if distanceToSpawn > SpawnScanRadius then continue end
+
+        local accepted = false
+        if SpawnTargetFilter == "All NPCs in area" then
+            accepted = true
+        elseif SpawnTargetFilter == "Farm mode filter" then
+            accepted = IsValidMobForMode(npc.Name)
+        else
+            accepted = npc.Name == spawn.MobName
+        end
+
+        if accepted then
+            table.insert(result, npc)
+        end
+    end
+
+    table.sort(result, function(a, b)
+        local _, rootA = getNPCParts(a)
+        local _, rootB = getNPCParts(b)
+        if not rootA then return false end
+        if not rootB then return true end
+        return (rootA.Position - spawn.Center).Magnitude < (rootB.Position - spawn.Center).Magnitude
+    end)
+
+    return result
 end
 
 local function freezeNPC(npc)
-    if not npc then return end
-    local root = npc:FindFirstChild("HumanoidRootPart")
-    local hum = npc:FindFirstChildOfClass("Humanoid")
-    if root then pcall(function() root.AssemblyLinearVelocity = Vector3.zero end) end
-    if hum then
+    local humanoid, root = getNPCParts(npc)
+
+    if root then
         pcall(function()
-            hum.AutoRotate = false
-            hum.PlatformStand = true
-            hum.WalkSpeed = 0
-            hum.JumpPower = 0
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end)
+    end
+
+    if humanoid then
+        if humanoid:GetAttribute("SonHubWalkSpeed") == nil then
+            humanoid:SetAttribute("SonHubWalkSpeed", humanoid.WalkSpeed)
+            humanoid:SetAttribute("SonHubJumpPower", humanoid.JumpPower)
+            humanoid:SetAttribute("SonHubAutoRotate", humanoid.AutoRotate)
+            humanoid:SetAttribute("SonHubPlatformStand", humanoid.PlatformStand)
+        end
+
+        pcall(function()
+            humanoid.AutoRotate = false
+            humanoid.PlatformStand = true
+            humanoid.WalkSpeed = 0
+            humanoid.JumpPower = 0
         end)
     end
 end
 
 local function unfreezeNPC(npc)
-    if not npc then return end
-    local hum = npc:FindFirstChildOfClass("Humanoid")
-    if hum then
+    local humanoid = npc and npc:FindFirstChildOfClass("Humanoid")
+    if not humanoid then return end
+
+    pcall(function()
+        local walkSpeed = humanoid:GetAttribute("SonHubWalkSpeed")
+        local jumpPower = humanoid:GetAttribute("SonHubJumpPower")
+        local autoRotate = humanoid:GetAttribute("SonHubAutoRotate")
+        local platformStand = humanoid:GetAttribute("SonHubPlatformStand")
+
+        humanoid.WalkSpeed = walkSpeed ~= nil and walkSpeed or 16
+        humanoid.JumpPower = jumpPower ~= nil and jumpPower or 50
+        humanoid.AutoRotate = autoRotate ~= nil and autoRotate or true
+        humanoid.PlatformStand = platformStand ~= nil and platformStand or false
+
+        humanoid:SetAttribute("SonHubWalkSpeed", nil)
+        humanoid:SetAttribute("SonHubJumpPower", nil)
+        humanoid:SetAttribute("SonHubAutoRotate", nil)
+        humanoid:SetAttribute("SonHubPlatformStand", nil)
+    end)
+end
+
+local function releaseBroughtNPCs()
+    for npc in pairs(BroughtNPCs) do
+        if npc and npc.Parent then
+            unfreezeNPC(npc)
+        end
+        BroughtNPCs[npc] = nil
+    end
+end
+
+local function getBringAnchorCFrame()
+    if BringAnchorMode == "Player Position" then
+        local playerRoot = getPlayerRoot()
+        if not playerRoot then return nil end
+        return CFrame.new(playerRoot.Position + Vector3.new(0, BringHeight, 0))
+    end
+
+    if not SelectedSpawn then return nil end
+    return CFrame.new(SelectedSpawn.Center + Vector3.new(0, BringHeight, 0))
+end
+
+local function bringSpawnNPCs()
+    if not AutoBringMobs or not SelectedSpawn then return end
+
+    local mobs = getSelectedSpawnNPCs()
+    if #mobs == 0 then return end
+
+    local limited = {}
+    for index = 1, math.min(#mobs, MaxBringMobs) do
+        limited[index] = mobs[index]
+    end
+
+    local anchor = getBringAnchorCFrame()
+    if not anchor then return end
+
+    local activeSet = {}
+    for index, npc in ipairs(limited) do
+        activeSet[npc] = true
+
+        local offset = Vector3.zero
+        if BringPattern == "Circle" and BringStackRadius > 0 then
+            local angle = ((index - 1) / math.max(#limited, 1)) * math.pi * 2
+            offset = Vector3.new(
+                math.cos(angle) * BringStackRadius,
+                0,
+                math.sin(angle) * BringStackRadius
+            )
+        elseif BringPattern == "Line" then
+            offset = Vector3.new((index - 1) * math.max(BringStackRadius, 1), 0, 0)
+        end
+
+        local targetCFrame = anchor + offset
+
+        if FreezeBroughtNPCs then
+            freezeNPC(npc)
+        else
+            local _, root = getNPCParts(npc)
+            if root then
+                pcall(function()
+                    root.AssemblyLinearVelocity = Vector3.zero
+                    root.AssemblyAngularVelocity = Vector3.zero
+                end)
+            end
+        end
+
+        BroughtNPCs[npc] = true
         pcall(function()
-            hum.AutoRotate = true
-            hum.PlatformStand = false
-            hum.WalkSpeed = 16
-            hum.JumpPower = 50
+            npc:PivotTo(targetCFrame)
         end)
     end
+
+    for npc in pairs(BroughtNPCs) do
+        if not activeSet[npc] or not npc.Parent then
+            if npc and npc.Parent then
+                unfreezeNPC(npc)
+            end
+            BroughtNPCs[npc] = nil
+        end
+    end
+end
+
+local function teleportToSelectedSpawn()
+    if not SelectedSpawn then
+        WindUI:Notify({ Title = "Auto Spawn", Content = "Select a spawn first", Duration = 2 })
+        return false
+    end
+
+    LastTeleportedSpawnLabel = SelectedSpawnLabel
+    return tweenToPosition(
+        SelectedSpawn.Center,
+        Vector3.new(0, 3, FarmDistance + BringStackRadius),
+        true
+    )
+end
+
+local function findMob()
+    local alive = getAliveFolder()
+    if not alive then return nil, nil, nil end
+
+    local candidates
+    if AutoSpawnEnabled and SelectedSpawn then
+        candidates = getSelectedSpawnNPCs()
+    else
+        candidates = alive:GetChildren()
+    end
+
+    local playerRoot = getPlayerRoot()
+    if not playerRoot then return nil, nil, nil end
+
+    local bestMob, bestHumanoid, bestRoot = nil, nil, nil
+    local bestDistance = math.huge
+    local lowestLevel = math.huge
+
+    for _, npc in ipairs(candidates) do
+        if not isAliveNPC(npc) then continue end
+        if not AutoSpawnEnabled and not IsValidMobForMode(npc.Name) then continue end
+
+        local humanoid, root = getNPCParts(npc)
+        local level = getLevelFromName(npc.Name)
+        local referencePosition = SelectedSpawn and SelectedSpawn.Center or playerRoot.Position
+        local distance = (root.Position - referencePosition).Magnitude
+
+        if AutoSpawnEnabled then
+            if distance < bestDistance then
+                bestDistance = distance
+                bestMob, bestHumanoid, bestRoot = npc, humanoid, root
+            end
+        elseif level < lowestLevel or (level == lowestLevel and distance < bestDistance) then
+            lowestLevel = level
+            bestDistance = distance
+            bestMob, bestHumanoid, bestRoot = npc, humanoid, root
+        end
+    end
+
+    return bestMob, bestHumanoid, bestRoot
 end
 
 local attackCooldown = 0
 local function attack()
-    local now = tick()
-    if now - attackCooldown < 0.05 then return end
+    local now = os.clock()
+    if now - attackCooldown < 0.08 then return end
     attackCooldown = now
-    
-    pcall(function()
-        if DamageEvent then
-            local tool = getTableKick()
-            DamageEvent:FireServer("Click", tool, CFrame.new())
-            DamageEvent:FireServer()
-            DamageEvent:FireServer("Melee")
-            DamageEvent:FireServer("Hit", tool)
-        end
-    end)
-    
-    pcall(function()
-        if SkillsReceiverEvent then
-            SkillsReceiverEvent:FireServer("F", "Table Kick")
-        end
-    end)
-    
-    pcall(function()
-        VirtualInput:SendMouseButtonEvent(0, 0, 0, true, Enum.UserInputType.MouseButton1, 1)
-        task.wait(0.01)
-        VirtualInput:SendMouseButtonEvent(0, 0, 0, false, Enum.UserInputType.MouseButton1, 1)
-    end)
-    
-    pcall(function()
-        VirtualUser:Button1Down(Vector2.new(500, 300), workspace.CurrentCamera.CFrame)
-        task.wait(0.01)
-        VirtualUser:Button1Up(Vector2.new(500, 300), workspace.CurrentCamera.CFrame)
-    end)
-    
-    local char = getCharacter()
-    if char then
-        local tool = char:FindFirstChildWhichIsA("Tool")
-        if tool then
-            pcall(function() tool:Activate() end)
-        end
+
+    local character = Player.Character
+    local tool = character and character:FindFirstChildWhichIsA("Tool")
+
+    if tool then
+        pcall(function() tool:Activate() end)
     end
-    
-    pcall(function()
-        if KeyBindEvent then
-            KeyBindEvent:FireServer("F", true)
-        end
-    end)
+
+    -- Keep only the known call shape. Do not spam several incompatible signatures.
+    if DamageEvent and tool then
+        pcall(function()
+            DamageEvent:FireServer("Click", tool, CFrame.new())
+        end)
+    end
 end
 
--- Farm loop
+local function stopFarmTarget()
+    if CurrentTarget then
+        unfreezeNPC(CurrentTarget)
+        CurrentTarget = nil
+    end
+    releaseBroughtNPCs()
+end
+
 task.spawn(function()
-    while task.wait(0.05) do
+    while task.wait(FarmTickInterval) do
+        if os.clock() - LastSpawnRefresh >= 3 then
+            refreshSpawnList(false)
+        end
+
         if not FarmEnabled then
+            if CurrentTarget or next(BroughtNPCs) then
+                stopFarmTarget()
+            end
+            continue
+        end
+
+        if AutoSpawnEnabled then
+            if not SelectedSpawn then
+                if AutoSelectNearestSpawn then
+                    selectNearestSpawn()
+                end
+
+                if not SelectedSpawn then
+                    if not MissingSpawnNotified then
+                        MissingSpawnNotified = true
+                        WindUI:Notify({
+                            Title = "Auto Spawn",
+                            Content = "No spawn selected. Open Farm > Spawn Scanner.",
+                            Duration = 3,
+                        })
+                    end
+                    continue
+                end
+            end
+
+            MissingSpawnNotified = false
+
+            if AutoTeleportToSpawn and LastTeleportedSpawnLabel ~= SelectedSpawnLabel then
+                task.spawn(teleportToSelectedSpawn)
+            end
+
+            if AutoBringMobs and os.clock() - LastBringAt >= BringInterval then
+                LastBringAt = os.clock()
+                bringSpawnNPCs()
+            end
+        end
+
+        local mob, humanoid, root = findMob()
+        if not mob or not humanoid or not root then
             if CurrentTarget then
                 unfreezeNPC(CurrentTarget)
                 CurrentTarget = nil
             end
             continue
         end
-        local mob, hum, root = findMob()
-        if mob and hum and root then
-            if CurrentTarget ~= mob then
-                if CurrentTarget then unfreezeNPC(CurrentTarget) end
-                CurrentTarget = mob
-            end
-            freezeNPC(CurrentTarget)
-            local char = getCharacter()
-            local myRoot = char and char:FindFirstChild("HumanoidRootPart")
-            if myRoot and root then
-                pcall(function()
-                    myRoot.CFrame = root.CFrame * CFrame.new(0, 0, 2.5)
-                end)
-            end
-            attack()
-            if hum.Health <= 0 then
+
+        if CurrentTarget ~= mob then
+            if CurrentTarget and not BroughtNPCs[CurrentTarget] then
                 unfreezeNPC(CurrentTarget)
-                CurrentTarget = nil
             end
+            CurrentTarget = mob
+        end
+
+        freezeNPC(CurrentTarget)
+
+        local playerRoot = getPlayerRoot()
+        if playerRoot then
+            pcall(function()
+                local targetPosition = root.Position + Vector3.new(0, 0, FarmDistance)
+                playerRoot.CFrame = CFrame.lookAt(targetPosition, root.Position)
+            end)
+        end
+
+        attack()
+
+        if humanoid.Health <= 0 then
+            BroughtNPCs[CurrentTarget] = nil
+            unfreezeNPC(CurrentTarget)
+            CurrentTarget = nil
         end
     end
 end)
 
--- Chest farm
 task.spawn(function()
     while task.wait(0.2) do
         if not ChestEnabled then continue end
@@ -531,7 +1153,6 @@ task.spawn(function()
     end
 end)
 
--- Haki Quest functions
 local function getAllRings()
     local rings = {}
     local mapFolder = workspace:FindFirstChild("MapFolder")
@@ -557,20 +1178,29 @@ local function getAllRings()
 end
 
 local function teleportToRayleigh()
-    local char = getCharacter()
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    if hrp then pcall(function() hrp.CFrame = CFrame.new(RAYLEIGH_POSITION) + Vector3.new(0, 3, 0) end) end
+    tweenToPosition(RAYLEIGH_POSITION, nil, true)
+end
+
+local function teleportToShopEmotes()
+    tweenToPosition(SHOP_EMOTES_POSITION, nil, true)
 end
 
 local currentRingIndex = 1
 local RingTweenActive = false
+local RingCollecting = false
 
 task.spawn(function()
     while true do
         task.wait(0.5)
         if not HakiQuestEnabled then 
             currentRingIndex = 1
+            RingCollecting = false
             continue 
+        end
+        
+        if RingCollecting then
+            task.wait(0.2)
+            continue
         end
         
         local rings = getAllRings()
@@ -592,36 +1222,37 @@ task.spawn(function()
             HakiQuestEnabled = false
             CollectedRings = {}
             currentRingIndex = 1
+            RingCollecting = false
             WindUI:Notify({ Title = "Haki Quest", Content = "Completed!", Duration = 3 })
             continue
         end
         
-        if currentRingIndex > #rings then
-            currentRingIndex = 1
+        local targetRing = nil
+        for _, ring in ipairs(rings) do
+            if not CollectedRings[ring.Name] then
+                targetRing = ring
+                break
+            end
         end
         
-        local ring = rings[currentRingIndex]
-        if not ring then
-            currentRingIndex = currentRingIndex + 1
+        if not targetRing then
+            task.wait(0.5)
             continue
         end
         
-        if CollectedRings[ring.Name] then
-            currentRingIndex = currentRingIndex + 1
-            continue
-        end
-        
-        if ring.Object and ring.Object.Parent and ring.CFrame and not RingTweenActive then
+        if targetRing.Object and targetRing.Object.Parent and targetRing.CFrame and not RingTweenActive then
+            RingCollecting = true
             local char = getCharacter()
             local hrp = char and char:FindFirstChild("HumanoidRootPart")
             if hrp then
                 RingTweenActive = true
                 
-                local targetPos = ring.CFrame.Position + Vector3.new(0, 2.5, 0)
-                local tweenInfo = TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+                local targetPos = targetRing.CFrame.Position + Vector3.new(0, 2.5, 0)
+                local duration = 0.4 / TweenSpeed
+                local tweenInfo = TweenInfo.new(duration, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
                 local tween = TweenService:Create(hrp, tweenInfo, {CFrame = CFrame.new(targetPos)})
                 pcall(function() tween:Play() end)
-                task.wait(0.4)
+                task.wait(duration + 0.1)
                 
                 local hum = char:FindFirstChildOfClass("Humanoid")
                 if hum then
@@ -636,17 +1267,25 @@ task.spawn(function()
                 end
                 
                 task.wait(0.2)
-                CollectedRings[ring.Name] = true
-                WindUI:Notify({ Title = "Ring", Content = "Collected " .. ring.Name .. " (" .. currentRingIndex .. "/" .. #rings .. ")", Duration = 2 })
-                currentRingIndex = currentRingIndex + 1
+                CollectedRings[targetRing.Name] = true
+                local ringNum = 0
+                for i, r in ipairs(rings) do
+                    if r.Name == targetRing.Name then
+                        ringNum = i
+                        break
+                    end
+                end
+                WindUI:Notify({ Title = "Ring", Content = "Collected " .. targetRing.Name .. " (" .. ringNum .. "/" .. #rings .. ")", Duration = 2 })
                 RingTweenActive = false
-                task.wait(0.1)
+                RingCollecting = false
+                task.wait(0.3)
+            else
+                RingCollecting = false
             end
         end
     end
 end)
 
--- Anti AFK
 local afkConnection = nil
 local function setupAntiAFK()
     if afkConnection then afkConnection:Disconnect() end
@@ -661,7 +1300,6 @@ local function setupAntiAFK()
 end
 setupAntiAFK()
 
--- Fly functions
 local FlyAttachment = nil
 local FlyLinearVelocity = nil
 local FlyBodyGyro = nil
@@ -767,7 +1405,6 @@ local function toggleFly()
     end
 end
 
--- Noclip
 local function toggleNoclip()
     NoclipEnabled = not NoclipEnabled
     if NoclipEnabled then
@@ -795,7 +1432,6 @@ local function toggleNoclip()
     end
 end
 
--- ESP
 local function toggleESP()
     ESPEnabled = not ESPEnabled
     if ESPEnabled then
@@ -842,7 +1478,6 @@ local function toggleESP()
     end
 end
 
--- Player functions
 local function GetPlayerList()
     local list = {"None"}
     for _, plr in ipairs(Players:GetPlayers()) do
@@ -914,15 +1549,11 @@ local function TeleportToPlayer(playerName)
         WindUI:Notify({ Title = "Teleport", Content = "No root part!", Duration = 2 })
         return
     end
-    local myChar = getCharacter()
-    local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
-    if myRoot then
-        pcall(function()
-            myRoot.CFrame = targetRoot.CFrame + Vector3.new(0, 1.5, 1.5)
-        end)
-        WindUI:Notify({ Title = "Teleport", Content = "Teleported to " .. target.Name, Duration = 2 })
-    end
+    tweenToPosition(targetRoot.Position, Vector3.new(0, 1.5, 1.5), true)
+    WindUI:Notify({ Title = "Teleport", Content = "Teleported to " .. target.Name, Duration = 2 })
 end
+
+local KillLoopConnection = nil
 
 local function StartKill(playerName)
     local target = Players:FindFirstChild(playerName)
@@ -949,7 +1580,7 @@ local function StartKill(playerName)
         if not target or not target.Character then
             WindUI:Notify({ Title = "Kill", Content = "Target lost!", Duration = 2 })
             KillActive = false
-            if KillToggleObj then KillToggleObj:SetValue(false) end
+            if killToggleObj then killToggleObj:SetValue(false) end
             if KillLoopConnection then KillLoopConnection:Disconnect(); KillLoopConnection = nil end
             return
         end
@@ -960,7 +1591,7 @@ local function StartKill(playerName)
         if not targetHum or not targetRoot or targetHum.Health <= 0 then
             WindUI:Notify({ Title = "Kill", Content = "Target eliminated!", Duration = 2 })
             KillActive = false
-            if KillToggleObj then KillToggleObj:SetValue(false) end
+            if killToggleObj then killToggleObj:SetValue(false) end
             CurrentKillTarget = nil
             if KillLoopConnection then KillLoopConnection:Disconnect(); KillLoopConnection = nil end
             return
@@ -991,7 +1622,6 @@ local function StopKill()
     WindUI:Notify({ Title = "Kill", Content = "Stopped", Duration = 2 })
 end
 
--- Auto Fishing
 local AutoFishingEnabled = false
 local AutoMinigameEnabled = false
 local FishingState = "IDLE"
@@ -1050,7 +1680,7 @@ local function ClickSelectedButton()
 end
 
 local function SetupMinigameListener()
-    local minigameGui = PlayerGui:FindFirstChild("FishingMinigame")
+    local minigameGui = Player.PlayerGui:FindFirstChild("FishingMinigame")
     if not minigameGui or not minigameGui.Enabled then return false end
     if MinigameActive then return true end
     MinigameActive = true
@@ -1145,7 +1775,7 @@ task.spawn(function()
                 end
             end
             if FishingState == "MINIGAME" then
-                local mg = PlayerGui:FindFirstChild("FishingMinigame")
+                local mg = Player.PlayerGui:FindFirstChild("FishingMinigame")
                 if not mg or not mg.Enabled then
                     FishingState = "IDLE"
                 end
@@ -1162,7 +1792,6 @@ task.spawn(function()
     end
 end)
 
--- Admin detection
 local AdminUserIds = { [1425918021] = true, [3160094389] = true }
 local function CheckForAdmins()
     for _, player in ipairs(Players:GetPlayers()) do
@@ -1170,7 +1799,7 @@ local function CheckForAdmins()
             WindUI:Notify({ Title = "Admin Detected", Content = player.Name .. " joined! Leaving...", Duration = 3 })
             task.wait(1)
             pcall(function()
-                game:GetService("TeleportService"):Teleport(game.PlaceId)
+                TeleportService:Teleport(game.PlaceId)
             end)
             return true
         end
@@ -1178,7 +1807,6 @@ local function CheckForAdmins()
     return false
 end
 
--- Hide nametag
 local function HideNametag()
     pcall(function()
         for _, obj in ipairs(Player.PlayerGui:GetDescendants()) do
@@ -1190,9 +1818,8 @@ local function HideNametag()
     end)
 end
 
--- Create WindUI Window
 local Window = WindUI:CreateWindow({
-    Title = "SON HUB V3.5",
+    Title = "SON HUB V4",
     Author = "by SonDepTrai",
     Icon = "solar:star-bold",
     Folder = "SON_HUB",
@@ -1212,9 +1839,8 @@ local Window = WindUI:CreateWindow({
     },
 })
 
--- Tags
 Window:Tag({
-    Title = "v3.5",
+    Title = "v4",
     Color = Color3.fromHex("#FF6B35"),
 })
 
@@ -1223,7 +1849,6 @@ Window:Tag({
     Color = Color3.fromHex("#FFD700"),
 })
 
--- Helper to get available weapons
 local function getAvailableWeapons()
     local weapons = {"None"}
     local backpack = Player:FindFirstChild("Backpack")
@@ -1237,7 +1862,6 @@ local function getAvailableWeapons()
     return weapons
 end
 
--- Variables for UI elements
 local weaponDropdown = nil
 local killToggleObj = nil
 local spectateToggleObj = nil
@@ -1246,7 +1870,79 @@ local flyToggleObj = nil
 local noclipToggleObj = nil
 local espToggleObj = nil
 
--- Define tabs
+local Islands = {
+    ["Sam"] = Vector3.new(-1282.53, 218.00, -1347.59),
+    ["Fisher"] = Vector3.new(-1689.73, 216.00, -320.37),
+    ["Sector G9"] = Vector3.new(-2681.07, 216.00, -943.29),
+    ["Marine Ford"] = Vector3.new(-3310.71, 300.75, -3286.47),
+    ["Purple Island"] = Vector3.new(-5273.88, 519.50, -7845.15),
+    ["Water Tower"] = Vector3.new(-233.99, 226.00, -1026.76),
+    ["Wind Mills"] = Vector3.new(65.12, 224.00, -35.69),
+    ["One House"] = Vector3.new(720.87, 241.00, 1214.81),
+    ["Restaurant"] = Vector3.new(1954.35, 218.00, 610.74),
+    ["King Crab"] = Vector3.new(1215.75, 243.00, -268.88),
+    ["Cave Island"] = Vector3.new(2052.59, 491.00, -656.71),
+    ["Big Tree"] = Vector3.new(2051.62, 288.00, -1871.25),
+    ["Krizma Island"] = Vector3.new(-1072.04, 361.00, 1677.36),
+    ["Gun Island"] = Vector3.new(-1846.41, 222.00, 3402.44),
+    ["Ancient Island"] = Vector3.new(-2721.82, 252.69, 1153.06),
+    ["C Island"] = Vector3.new(2953.90, 217.00, 1394.13),
+    ["Bar Island"] = Vector3.new(1481.25, 263.90, 2117.69),
+    ["Anna House"] = Vector3.new(1118.05, 217.20, 3353.08),
+    ["Crocodile Land"] = Vector3.new(948.70, 392.59, 5014.60),
+    ["Three Tree"] = Vector3.new(-5703.31, 216.00, 123.44),
+    ["Hole Land"] = Vector3.new(-10913.88, 551.00, 5063.75),
+    ["Many Land"] = Vector3.new(-9258.29, 216.00, -3025.81),
+    ["Haki Land"] = Vector3.new(-1002.16, 4010.97, 10158.25),
+    ["Vokun Land"] = Vector3.new(4685.26, 217.00, 4817.13),
+    ["Big Snow"] = Vector3.new(6275.28, 487.00, -1829.30),
+}
+
+local DailyQuest = {
+    ["C0"] = Vector3.new(904.962, 270.000, 1219.497),
+    ["Cooker"] = Vector3.new(1982.699, 218.594, 564.230),
+    ["Fisherman"] = Vector3.new(-1700.615, 216.000, -325.708),
+    ["Sam"] = Vector3.new(-1304.967, 218.062, -1352.638),
+    ["Gemologist"] = Vector3.new(-1233.042, 218.100, 633.124),
+}
+
+local Shop = {
+    ["Better Drink Merchant"] = Vector3.new(1492.026, 260.297, 2170.900),
+    ["Boat Merchant (Main)"] = Vector3.new(-133.436, 216.000, -669.301),
+    ["Boat Merchant (Sam)"] = Vector3.new(-1251.926, 218.209, -1173.319),
+    ["Fred The Blacksmith"] = Vector3.new(-1071.015, 360.792, 1663.899),
+    ["Lucy"] = Vector3.new(800.032, 230.358, 5352.617),
+    ["Sniper Merchant"] = Vector3.new(-1843.401, 222.000, 3414.160),
+    ["Sword Merchant"] = Vector3.new(1000.400, 224.000, -3338.100),
+    ["Boat Merchant (One House)"] = Vector3.new(588.943, 216.102, 1164.866),
+    ["Boat Merchant (Cave)"] = Vector3.new(2090.621, 215.960, -354.880),
+    ["Drink Merchant"] = Vector3.new(-1281.600, 218.297, -1369.100),
+    ["Anna"] = Vector3.new(1110.400, 217.000, 3367.900),
+    ["Boat Merchant (Water)"] = Vector3.new(0.214, 216.046, -414.085),
+    ["Dancer"] = Vector3.new(1518.810, 260.384, 2164.469),
+    ["Mad Scientist"] = Vector3.new(-2599.496, 253.769, 1088.038),
+}
+
+local Quest = {
+    ["Guard Captain"] = Vector3.new(-50.933, 259.483, 333.586),
+    ["Marge Nospmis"] = Vector3.new(-101.901, 224.198, -74.555),
+    ["Rayleigh"] = Vector3.new(-1009.754, 4011.465, 10135.117),
+    ["Fallen Captain"] = Vector3.new(-236.842, 217.000, -865.110),
+    ["Traceur"] = Vector3.new(-293.384, 305.883, -578.215),
+    ["Old Beggar"] = Vector3.new(186.882, 216.000, -140.655),
+    ["Joe"] = Vector3.new(-58.575, 216.100, -315.145),
+    ["Chill Billy"] = Vector3.new(35.894, 229.416, -191.397),
+    ["Bandits Leader"] = Vector3.new(34.274, 296.000, -823.462),
+    ["Demon Hunter"] = Vector3.new(-50.477, 217.080, -912.140),
+    ["Explorer"] = Vector3.new(-519.591, 216.100, -891.129),
+}
+
+local Secret = {
+    ["Lord"] = Vector3.new(1787.769, 642.033, 13022.767),
+    ["Strange Dealer"] = Vector3.new(1245.006, 224.300, -3239.817),
+    ["Bart Nospmis"] = Vector3.new(-433.215, 214.821, -172.187),
+}
+
 local FarmTab = Window:Tab({ Title = "Farm", Icon = "solar:leaf-bold" })
 local ConfigFarmTab = Window:Tab({ Title = "Config Farm", Icon = "solar:cpu-bold" })
 local TeleportTab = Window:Tab({ Title = "Teleport", Icon = "solar:planet-bold" })
@@ -1254,7 +1950,233 @@ local PlayerTab = Window:Tab({ Title = "Player", Icon = "lucide:users" })
 local QuestTab = Window:Tab({ Title = "Quest", Icon = "solar:crown-bold" })
 local MiscTab = Window:Tab({ Title = "Misc", Icon = "solar:settings-bold" })
 
--- Farm Tab
+local SpawnSection = FarmTab:Section({ Title = "Spawn Scanner", Opened = true })
+
+SpawnDropdown = SpawnSection:Dropdown({
+    Title = "< Spawn >",
+    Desc = "Automatically scanned from Workspace.Alive; player characters are excluded.",
+    Values = { "None" },
+    Value = "None",
+    Callback = function(value)
+        SelectedSpawnLabel = value or "None"
+        SelectedSpawn = SpawnRegistry[SelectedSpawnLabel]
+        LastTeleportedSpawnLabel = nil
+        MissingSpawnNotified = false
+
+        if SelectedSpawn then
+            WindUI:Notify({
+                Title = "Spawn Selected",
+                Content = string.format("%s | %d NPC alive", SelectedSpawnLabel, SelectedSpawn.LiveCount or 0),
+                Duration = 2,
+            })
+        end
+    end,
+})
+
+SpawnSection:Button({
+    Title = "Refresh Spawn List",
+    Icon = "refresh-ccw",
+    Callback = function()
+        refreshSpawnList(true)
+    end,
+})
+
+SpawnSection:Button({
+    Title = "Select Nearest Spawn",
+    Icon = "locate-fixed",
+    Callback = function()
+        refreshSpawnList(false)
+        local label = selectNearestSpawn()
+        WindUI:Notify({
+            Title = "Nearest Spawn",
+            Content = label or "No spawn found",
+            Duration = 2,
+        })
+    end,
+})
+
+SpawnSection:Button({
+    Title = "Teleport to Selected Spawn",
+    Icon = "send",
+    Callback = function()
+        task.spawn(teleportToSelectedSpawn)
+    end,
+})
+
+AutoSpawnToggleObject = SpawnSection:Toggle({
+    Title = "Auto Spawn Farm",
+    Flag = "AutoSpawnFarm",
+    Value = false,
+    Callback = function(value)
+        AutoSpawnEnabled = value
+        LastTeleportedSpawnLabel = nil
+        MissingSpawnNotified = false
+
+        if value then
+            refreshSpawnList(false)
+            if not SelectedSpawn and AutoSelectNearestSpawn then
+                selectNearestSpawn()
+            end
+        else
+            stopFarmTarget()
+        end
+    end,
+})
+
+SpawnSection:Toggle({
+    Title = "Auto Select Nearest Spawn",
+    Flag = "AutoSelectNearestSpawn",
+    Value = false,
+    Callback = function(value)
+        AutoSelectNearestSpawn = value
+        if value and not SelectedSpawn then
+            refreshSpawnList(false)
+            selectNearestSpawn()
+        end
+    end,
+})
+
+SpawnSection:Toggle({
+    Title = "Auto Teleport to Spawn",
+    Flag = "AutoTeleportSpawn",
+    Value = true,
+    Callback = function(value)
+        AutoTeleportToSpawn = value
+        LastTeleportedSpawnLabel = nil
+    end,
+})
+
+SpawnSection:Toggle({
+    Title = "Auto Bring NPCs",
+    Desc = "Scan NPCs around the selected spawn, group them, then farm.",
+    Flag = "AutoBringSpawnNPCs",
+    Value = false,
+    Callback = function(value)
+        AutoBringMobs = value
+        if not value then
+            releaseBroughtNPCs()
+        end
+    end,
+})
+
+SpawnSection:Dropdown({
+    Title = "Bring To",
+    Values = { "Spawn Center", "Player Position" },
+    Value = "Spawn Center",
+    Callback = function(value)
+        BringAnchorMode = value
+    end,
+})
+
+SpawnSection:Dropdown({
+    Title = "Bring Pattern",
+    Values = { "Circle", "Stack", "Line" },
+    Value = "Circle",
+    Callback = function(value)
+        BringPattern = value
+    end,
+})
+
+SpawnSection:Toggle({
+    Title = "Freeze Brought NPCs",
+    Desc = "Stops brought NPCs from walking away.",
+    Flag = "FreezeBroughtNPCs",
+    Value = true,
+    Callback = function(value)
+        FreezeBroughtNPCs = value
+        if not value then
+            for npc in pairs(BroughtNPCs) do
+                if npc and npc.Parent then
+                    unfreezeNPC(npc)
+                end
+            end
+        end
+    end,
+})
+
+SpawnSection:Dropdown({
+    Title = "Target Filter",
+    Values = { "Selected NPC", "All NPCs in area", "Farm mode filter" },
+    Value = "Selected NPC",
+    Callback = function(value)
+        SpawnTargetFilter = value
+        CurrentTarget = nil
+    end,
+})
+
+SpawnSection:Slider({
+    Title = "Area Scan Radius",
+    Flag = "SpawnScanRadius",
+    Value = { Min = 40, Max = 600, Default = 220 },
+    Step = 10,
+    Callback = function(value)
+        SpawnScanRadius = value
+    end,
+})
+
+SpawnSection:Slider({
+    Title = "Spawn Cluster Distance",
+    Flag = "SpawnClusterDistance",
+    Value = { Min = 50, Max = 350, Default = 160 },
+    Step = 10,
+    Callback = function(value)
+        SpawnClusterDistance = value
+        refreshSpawnList(false)
+    end,
+})
+
+SpawnSection:Slider({
+    Title = "Max NPCs to Bring",
+    Flag = "MaxBringNPCs",
+    Value = { Min = 1, Max = 25, Default = 10 },
+    Step = 1,
+    Callback = function(value)
+        MaxBringMobs = value
+    end,
+})
+
+SpawnSection:Slider({
+    Title = "Bring Stack Radius",
+    Flag = "BringStackRadius",
+    Value = { Min = 0, Max = 15, Default = 5 },
+    Step = 1,
+    Callback = function(value)
+        BringStackRadius = value
+    end,
+})
+
+SpawnSection:Slider({
+    Title = "Bring Height",
+    Flag = "BringHeight",
+    Value = { Min = -5, Max = 15, Default = 0 },
+    Step = 1,
+    Callback = function(value)
+        BringHeight = value
+    end,
+})
+
+SpawnSection:Slider({
+    Title = "Bring Interval",
+    Flag = "BringInterval",
+    Value = { Min = 0.1, Max = 1.5, Default = 0.25 },
+    Step = 0.05,
+    Callback = function(value)
+        BringInterval = value
+    end,
+})
+
+SpawnSection:Slider({
+    Title = "Farm Distance",
+    Flag = "SpawnFarmDistance",
+    Value = { Min = 2, Max = 15, Default = 4 },
+    Step = 0.5,
+    Callback = function(value)
+        FarmDistance = value
+    end,
+})
+
+SpawnSection:Divider()
+
 local FarmSection = FarmTab:Section({ Title = "Auto Farm", Opened = true })
 
 FarmSection:Button({
@@ -1275,9 +2197,13 @@ FarmSection:Toggle({
     Value = false,
     Callback = function(v)
         FarmEnabled = v
-        if not v and CurrentTarget then
-            unfreezeNPC(CurrentTarget)
-            CurrentTarget = nil
+        if not v then
+            stopFarmTarget()
+        elseif AutoSpawnEnabled and not SelectedSpawn then
+            refreshSpawnList(false)
+            if AutoSelectNearestSpawn then
+                selectNearestSpawn()
+            end
         end
     end
 })
@@ -1318,6 +2244,9 @@ FarmSection:Toggle({
     Value = false,
     Callback = function(v)
         ChestEnabled = v
+        if not v then
+            AutoChestForOldBook = false
+        end
     end
 })
 
@@ -1352,16 +2281,6 @@ BringSection:Toggle({
     end
 })
 
-BringSection:Toggle({
-    Title = "Auto Bring Old Book",
-    Flag = "AutoBringOldBook",
-    Value = false,
-    Callback = function(v)
-        AutoBringOldBook = v
-    end
-})
-
--- Config Farm Tab
 local ConfigSection = ConfigFarmTab:Section({ Title = "Auto Skill", Opened = true })
 
 ConfigSection:Toggle({
@@ -1402,165 +2321,134 @@ HakiSection:Toggle({
     end
 })
 
--- Teleport Tab
-local TeleportSection = TeleportTab:Section({ Title = "Teleport", Opened = true })
+local IslandSection = TeleportTab:Section({ Title = "Islands", Opened = true })
 
-local Islands = {
-    ["Sam"] = Vector3.new(-1282.53, 218.00, -1347.59),
-    ["Fisher"] = Vector3.new(-1689.73, 216.00, -320.37),
-    ["SectorG9"] = Vector3.new(-2681.07, 216.00, -943.29),
-    ["MarineFord"] = Vector3.new(-3310.71, 300.75, -3286.47),
-    ["Purple Island"] = Vector3.new(-5273.88, 519.50, -7845.15),
-    ["Water tower"] = Vector3.new(-233.99, 226.00, -1026.76),
-    ["WindMills"] = Vector3.new(65.12, 224.00, -35.69),
-    ["OneHouse"] = Vector3.new(720.87, 241.00, 1214.81),
-    ["restaurant"] = Vector3.new(1954.35, 218.00, 610.74),
-    ["KingCrab"] = Vector3.new(1215.75, 243.00, -268.88),
-    ["CaveIsland"] = Vector3.new(2052.59, 491.00, -656.71),
-    ["BigTree"] = Vector3.new(2051.62, 288.00, -1871.25),
-    ["Krizma Island"] = Vector3.new(-1072.04, 361.00, 1677.36),
-    ["Gun Island"] = Vector3.new(-1846.41, 222.00, 3402.44),
-    ["Accient Island"] = Vector3.new(-2721.82, 252.69, 1153.06),
-    ["C Island"] = Vector3.new(2953.90, 217.00, 1394.13),
-    ["Bar Island"] = Vector3.new(1481.25, 263.90, 2117.69),
-    ["Anna House"] = Vector3.new(1118.05, 217.20, 3353.08),
-    ["Crocodile Land"] = Vector3.new(948.70, 392.59, 5014.60),
-    ["Three Tree"] = Vector3.new(-5703.31, 216.00, 123.44),
-    ["Hole Land"] = Vector3.new(-10913.88, 551.00, 5063.75),
-    ["Many Land"] = Vector3.new(-9258.29, 216.00, -3025.81),
-    ["Haki Land"] = Vector3.new(-1002.16, 4010.97, 10158.25),
-    ["Vokun Land"] = Vector3.new(4685.26, 217.00, 4817.13),
-    ["BigSnow"] = Vector3.new(6275.28, 487.00, -1829.30),
-}
-
-local IslandNamesList = {"None"}
+local IslandNamesList = {}
 for name in pairs(Islands) do
     table.insert(IslandNamesList, name)
 end
 table.sort(IslandNamesList)
 
-TeleportSection:Dropdown({
+IslandSection:Dropdown({
     Title = "Select Island",
     Values = IslandNamesList,
     Value = "None",
     Callback = function(v)
         if v ~= "None" and Islands[v] then
-            local char = getCharacter()
-            local hrp = char and char:FindFirstChild("HumanoidRootPart")
-            if hrp then
-                pcall(function()
-                    hrp.CFrame = CFrame.new(Islands[v]) + Vector3.new(0, 3, 0)
-                end)
-                WindUI:Notify({ Title = "Teleport", Content = "Teleported to " .. v, Duration = 2 })
-            end
+            tweenToPosition(Islands[v], nil, true)
+            WindUI:Notify({ Title = "Teleport", Content = "Teleported to " .. v, Duration = 2 })
         end
     end
 })
 
-TeleportSection:Divider()
+IslandSection:Divider()
 
-local ShopNPCs = {
-    ["Sniper Shop"] = Vector3.new(-1843.3797607421875, 221.99998474121094, 3409.400634765625),
-    ["Sword Shop"] = Vector3.new(1005.53515625, 223.99998474121094, -3337.915283203125),
-    ["Strange Dealer"] = Vector3.new(1240.8421630859375, 224.20001220703125, -3240.296875),
-}
+local DailySection = TeleportTab:Section({ Title = "Daily Quest", Opened = true })
 
-local ShopNames = {"None"}
-for name in pairs(ShopNPCs) do
+local DailyNames = {}
+for name in pairs(DailyQuest) do
+    table.insert(DailyNames, name)
+end
+table.sort(DailyNames)
+
+DailySection:Dropdown({
+    Title = "Select Daily Quest NPC",
+    Values = DailyNames,
+    Value = "None",
+    Callback = function(v)
+        if v ~= "None" and DailyQuest[v] then
+            tweenToPosition(DailyQuest[v], nil, true)
+            WindUI:Notify({ Title = "Teleport", Content = "Teleported to " .. v, Duration = 2 })
+        end
+    end
+})
+
+DailySection:Divider()
+
+local ShopSection = TeleportTab:Section({ Title = "Shops", Opened = true })
+
+local ShopNames = {}
+for name in pairs(Shop) do
     table.insert(ShopNames, name)
 end
 table.sort(ShopNames)
 
-TeleportSection:Dropdown({
-    Title = "Shop Teleport",
+ShopSection:Dropdown({
+    Title = "Select Shop",
     Values = ShopNames,
     Value = "None",
     Callback = function(v)
-        if v ~= "None" and ShopNPCs[v] then
-            local char = getCharacter()
-            local hrp = char and char:FindFirstChild("HumanoidRootPart")
-            if hrp then
-                pcall(function()
-                    hrp.CFrame = CFrame.new(ShopNPCs[v]) + Vector3.new(0, 3, 0)
-                end)
-                WindUI:Notify({ Title = "Teleport", Content = "Teleported to " .. v, Duration = 2 })
-            end
+        if v ~= "None" and Shop[v] then
+            tweenToPosition(Shop[v], nil, true)
+            WindUI:Notify({ Title = "Teleport", Content = "Teleported to " .. v, Duration = 2 })
         end
     end
 })
 
-TeleportSection:Divider()
+ShopSection:Divider()
 
-local QuestNPCs = {
-    ["Daily Quest"] = Vector3.new(-2606.061279296875, 253.69842529296875, 1087.8436279296875),
-    ["Sam Quest"] = Vector3.new(-1303.5345458984375, 217.99998474121094, -1352.5908203125),
-    ["Krizma Sword"] = Vector3.new(-1074.173828125, 360.999694824219, 1666.887084969375),
-    ["Mode Position"] = Vector3.new(2053.41552734375, 497.69830322265625, -614.63305640625),
-}
+local QuestSectionTP = TeleportTab:Section({ Title = "Quest NPCs", Opened = true })
 
-local QuestNames = {"None"}
-for name in pairs(QuestNPCs) do
+local QuestNames = {}
+for name in pairs(Quest) do
     table.insert(QuestNames, name)
 end
 table.sort(QuestNames)
 
-TeleportSection:Dropdown({
-    Title = "Quest NPC Teleport",
+QuestSectionTP:Dropdown({
+    Title = "Select Quest NPC",
     Values = QuestNames,
     Value = "None",
     Callback = function(v)
-        if v ~= "None" and QuestNPCs[v] then
-            local char = getCharacter()
-            local hrp = char and char:FindFirstChild("HumanoidRootPart")
-            if hrp then
-                pcall(function()
-                    hrp.CFrame = CFrame.new(QuestNPCs[v]) + Vector3.new(0, 3, 0)
-                end)
-                WindUI:Notify({ Title = "Teleport", Content = "Teleported to " .. v, Duration = 2 })
-            end
+        if v ~= "None" and Quest[v] then
+            tweenToPosition(Quest[v], nil, true)
+            WindUI:Notify({ Title = "Teleport", Content = "Teleported to " .. v, Duration = 2 })
         end
     end
 })
 
-TeleportSection:Divider()
+QuestSectionTP:Divider()
 
-local MiscNPCs = {
-    ["Stats Fruit Roll"] = Vector3.new(801.1287231445312, 230.37062072753906, 5354.083984375),
-    ["Roll Stats Fruit"] = Vector3.new(801.3805541992188, 230.37062072753906, 5353.8662109375),
-}
+local SecretSection = TeleportTab:Section({ Title = "Secret Locations", Opened = true })
 
-local MiscNames = {"None"}
-for name in pairs(MiscNPCs) do
-    table.insert(MiscNames, name)
+local SecretNames = {}
+for name in pairs(Secret) do
+    table.insert(SecretNames, name)
 end
-table.sort(MiscNames)
+table.sort(SecretNames)
 
-TeleportSection:Dropdown({
-    Title = "Misc NPC Teleport",
-    Values = MiscNames,
+SecretSection:Dropdown({
+    Title = "Select Secret Location",
+    Values = SecretNames,
     Value = "None",
     Callback = function(v)
-        if v ~= "None" and MiscNPCs[v] then
-            local char = getCharacter()
-            local hrp = char and char:FindFirstChild("HumanoidRootPart")
-            if hrp then
-                pcall(function()
-                    hrp.CFrame = CFrame.new(MiscNPCs[v]) + Vector3.new(0, 3, 0)
-                end)
-                WindUI:Notify({ Title = "Teleport", Content = "Teleported to " .. v, Duration = 2 })
-            end
+        if v ~= "None" and Secret[v] then
+            tweenToPosition(Secret[v], nil, true)
+            WindUI:Notify({ Title = "Teleport", Content = "Teleported to " .. v, Duration = 2 })
         end
     end
 })
 
-TeleportSection:Button({
+SecretSection:Divider()
+
+local SpecialSection = TeleportTab:Section({ Title = "Special", Opened = true })
+
+SpecialSection:Button({
     Title = "Teleport to Rayleigh",
+    Icon = "crown",
     Callback = function()
         teleportToRayleigh()
     end
 })
 
--- Player Tab
+SpecialSection:Button({
+    Title = "Teleport to Stats Fruit Roll",
+    Icon = "dice",
+    Callback = function()
+        tweenToPosition(Vector3.new(801.1287231445312, 230.37062072753906, 5354.083984375), nil, true)
+    end
+})
+
 local PlayersSection = PlayerTab:Section({ Title = "Player Control", Opened = true })
 
 mainPlayerDropdown = PlayersSection:Dropdown({
@@ -1694,7 +2582,6 @@ espToggleObj = UtilitySection:Toggle({
     end
 })
 
--- Quest Tab
 local QuestSection = QuestTab:Section({ Title = "Haki Quest", Opened = true })
 
 QuestSection:Toggle({
@@ -1707,7 +2594,34 @@ QuestSection:Toggle({
             CollectedRings = {}
             currentRingIndex = 1
             RingTweenActive = false
+            RingCollecting = false
         end
+    end
+})
+
+QuestSection:Toggle({
+    Title = "Auto Collect OldBook",
+    Flag = "AutoBringOldBookQuest",
+    Value = false,
+    Callback = function(v)
+        AutoBringOldBook = v
+        if v then
+            WindUI:Notify({ Title = "OldBook", Content = "Auto Collect OldBook enabled", Duration = 2 })
+        else
+            if AutoChestForOldBook then
+                ChestEnabled = false
+                AutoChestForOldBook = false
+            end
+            WindUI:Notify({ Title = "OldBook", Content = "Auto Collect OldBook disabled", Duration = 2 })
+        end
+    end
+})
+
+QuestSection:Button({
+    Title = "Teleport to Shop Emotes",
+    Icon = "shopping-bag",
+    Callback = function()
+        teleportToShopEmotes()
     end
 })
 
@@ -1724,6 +2638,7 @@ QuestSection:Button({
         CollectedRings = {}
         currentRingIndex = 1
         RingTweenActive = false
+        RingCollecting = false
         WindUI:Notify({ Title = "Reset", Content = "Progress reset", Duration = 2 })
     end
 })
@@ -1754,7 +2669,6 @@ FishingSection:Toggle({
     end
 })
 
--- Misc Tab
 local MiscSection = MiscTab:Section({ Title = "Settings", Opened = true })
 
 MiscSection:Toggle({
@@ -1767,32 +2681,23 @@ MiscSection:Toggle({
     end
 })
 
-MiscSection:Divider()
-
-local ThemeSection = MiscTab:Section({ Title = "Themes", Opened = true })
-
-local themes = {
-    "Dark", "Light", "Mellowsi", "Dracula", "Catppuccin",
-    "Tokyo Night", "Nord", "Gruvbox", "Solarized Dark"
-}
-
-for _, theme in ipairs(themes) do
-    ThemeSection:Button({
-        Title = theme,
-        Callback = function()
-            Window:SetTheme(theme)
-            WindUI:Notify({ Title = "Theme", Content = theme .. " applied", Duration = 2 })
-        end
-    })
-end
+MiscSection:Slider({
+    Title = "Tween Speed",
+    Flag = "TweenSpeed",
+    Value = { Min = 0.5, Max = 3.0, Default = 1.0 },
+    Step = 0.1,
+    Callback = function(v)
+        TweenSpeed = v
+    end
+})
 
 MiscSection:Divider()
 
 local InfoSection = MiscTab:Section({ Title = "Info", Opened = true })
 
 InfoSection:Paragraph({
-    Title = "SON HUB V3.5",
-    Desc = "Created by SonDepTrai\nVersion 3.5\nDiscord: https://discord.gg/faZagWVm72",
+    Title = "SON HUB V4",
+    Desc = "Created by SonDepTrai\nVersion 4\nDiscord: https://discord.gg/faZagWVm72",
     Image = "info",
     ImageSize = 20,
 })
@@ -1806,7 +2711,18 @@ InfoSection:Button({
     end
 })
 
--- Events
+task.defer(function()
+    task.wait(0.5)
+    refreshSpawnList(false)
+    Window:Dialog({
+        Title = "Auto Spawn",
+        Content = "Farm > < Spawn >: choose a scanned spawn, enable Auto Spawn Farm, then enable Auto Bring NPCs if needed.",
+        Buttons = {
+            { Title = "OK", Variant = "Primary" },
+        },
+    })
+end)
+
 Players.PlayerAdded:Connect(function()
     task.wait(0.5)
     local newList = GetPlayerList()
@@ -1863,7 +2779,6 @@ Players.PlayerRemoving:Connect(function()
     end
 end)
 
--- Hide nametag
 HideNametag()
 Player.PlayerGui.DescendantAdded:Connect(function(desc)
     task.wait(0.1)
@@ -1874,7 +2789,6 @@ Player.PlayerGui.DescendantAdded:Connect(function(desc)
     end
 end)
 
--- Check admins
 CheckForAdmins()
 Players.PlayerAdded:Connect(function(player)
     task.wait(0.5)
@@ -1882,7 +2796,7 @@ Players.PlayerAdded:Connect(function(player)
         WindUI:Notify({ Title = "Admin Joined", Content = player.Name .. " joined! Leaving...", Duration = 3 })
         task.wait(1)
         pcall(function()
-            game:GetService("TeleportService"):Teleport(game.PlaceId)
+            TeleportService:Teleport(game.PlaceId)
         end)
     end
 end)
@@ -1893,7 +2807,6 @@ task.spawn(function()
     end
 end)
 
--- Create toggle button for mobile/desktop
 local toggleSize = isMobile and 50 or 65
 local togglePos = isMobile and 60 or 90
 
@@ -1953,5 +2866,4 @@ UserInputService.InputEnded:Connect(function(input)
     end
 end)
 
--- Notify
-WindUI:Notify({ Title = "SON HUB V3.5", Content = "Loaded Successfully!", Duration = 3 })
+WindUI:Notify({ Title = "SON HUB V4", Content = "Loaded Successfully!", Duration = 3 })
