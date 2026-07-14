@@ -1,36 +1,138 @@
 -- SON HUB V4 - WindUI Version
--- Single-file Auto Spawn / Auto Bring build
+-- Single-file Auto Spawn / Auto Bring build - compatibility fix
 -- Created by SonDepTrai
 
 local WindUI
-local cloneref = (cloneref or clonereference or function(instance) return instance end)
-local ReplicatedStorage = cloneref(game:GetService("ReplicatedStorage"))
-local RunService = cloneref(game:GetService("RunService"))
+local clonerefFn = cloneref or clonereference or function(instance)
+    return instance
+end
 
-do
-    local ok, result = pcall(function()
+local ReplicatedStorage = clonerefFn(game:GetService("ReplicatedStorage"))
+local RunService = clonerefFn(game:GetService("RunService"))
+
+local function loadWindUI()
+    local errors = {}
+
+    -- Local repository / Roblox Studio package.
+    local okLocal, localResult = pcall(function()
         return require("./src/Init")
     end)
-    if ok then
-        WindUI = result
+    if okLocal and localResult then
+        return localResult
+    end
+    table.insert(errors, "local require: " .. tostring(localResult))
+
+    -- ReplicatedStorage module fallback.
+    local moduleFolder = ReplicatedStorage:FindFirstChild("WindUI")
+    local moduleInit = moduleFolder and moduleFolder:FindFirstChild("Init")
+    if moduleInit then
+        local okModule, moduleResult = pcall(require, moduleInit)
+        if okModule and moduleResult then
+            return moduleResult
+        end
+        table.insert(errors, "ReplicatedStorage require: " .. tostring(moduleResult))
+    end
+
+    -- External runtime fallback. Do not use writefile as a capability test:
+    -- lightweight runtimes may support HTTP/loadstring but not file APIs.
+    local compiler = loadstring or load
+    if type(compiler) ~= "function" then
+        error("No loadstring/load function and no ReplicatedStorage.WindUI module")
+    end
+
+    local url = "https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"
+    local source = nil
+    local fetchError = nil
+
+    local okHttpGet, httpResult = pcall(function()
+        return game:HttpGet(url)
+    end)
+    if okHttpGet and type(httpResult) == "string" and #httpResult > 0 then
+        source = httpResult
     else
-        if RunService:IsStudio() or not writefile then
-            WindUI = require(ReplicatedStorage:WaitForChild("WindUI"):WaitForChild("Init"))
-        else
-            WindUI = loadstring(game:HttpGet("https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"))()
+        fetchError = httpResult
+    end
+
+    if not source then
+        local requestFn = nil
+        if type(request) == "function" then
+            requestFn = request
+        elseif type(http_request) == "function" then
+            requestFn = http_request
+        elseif type(syn) == "table" and type(syn.request) == "function" then
+            requestFn = syn.request
+        end
+
+        if requestFn then
+            local okRequest, response = pcall(requestFn, {
+                Url = url,
+                Method = "GET",
+            })
+            if okRequest and type(response) == "table" then
+                source = response.Body or response.body
+            elseif not okRequest then
+                fetchError = response
+            end
         end
     end
+
+    if type(source) ~= "string" or #source == 0 then
+        error("Unable to download WindUI: " .. tostring(fetchError))
+    end
+
+    local chunk, compileError = compiler(source)
+    if type(chunk) ~= "function" then
+        error("WindUI compile failed: " .. tostring(compileError))
+    end
+
+    local okRun, result = pcall(chunk)
+    if not okRun or not result then
+        error("WindUI runtime failed: " .. tostring(result))
+    end
+
+    return result
 end
+
+local windOk, windResult = pcall(loadWindUI)
+if not windOk then
+    error("[SON HUB] " .. tostring(windResult), 0)
+end
+WindUI = windResult
 
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
-local VirtualInput = game:GetService("VirtualInputManager")
-local VirtualUser = game:GetService("VirtualUser")
+local VirtualInput = nil
+pcall(function()
+    VirtualInput = game:GetService("VirtualInputManager")
+end)
+local VirtualUser = nil
+pcall(function()
+    VirtualUser = game:GetService("VirtualUser")
+end)
 local Workspace = game:GetService("Workspace")
 local TweenService = game:GetService("TweenService")
 local Player = Players.LocalPlayer
 local TeleportService = game:GetService("TeleportService")
 local GuiService = game:GetService("GuiService")
+
+
+local WorkspaceDescendantCache = {}
+local WorkspaceDescendantCacheTime = 0
+local WORKSPACE_CACHE_TTL = 1.25
+
+local function getWorkspaceDescendantsCached(forceRefresh)
+    local now = os.clock()
+    if forceRefresh or now - WorkspaceDescendantCacheTime >= WORKSPACE_CACHE_TTL then
+        local ok, descendants = pcall(function()
+            return Workspace:GetDescendants()
+        end)
+        if ok and type(descendants) == "table" then
+            WorkspaceDescendantCache = descendants
+            WorkspaceDescendantCacheTime = now
+        end
+    end
+    return WorkspaceDescendantCache
+end
 
 local isMobile = UserInputService.TouchEnabled
 local screenSize = workspace.CurrentCamera.ViewportSize
@@ -296,9 +398,9 @@ task.spawn(function()
         local keyCode = Enum.KeyCode[key]
         if not keyCode then return end
         pcall(function()
-            VirtualInput:SendKeyEvent(true, keyCode, false, game)
+            if VirtualInput then VirtualInput:SendKeyEvent(true, keyCode, false, game) end
             task.wait(0.05)
-            VirtualInput:SendKeyEvent(false, keyCode, false, game)
+            if VirtualInput then VirtualInput:SendKeyEvent(false, keyCode, false, game) end
         end)
     end
     
@@ -339,9 +441,9 @@ task.spawn(function()
             local observation = char:GetAttribute("Observation")
             if not observation then
                 pcall(function()
-                    VirtualInput:SendKeyEvent(true, Enum.KeyCode.R, false, game)
+                    if VirtualInput then VirtualInput:SendKeyEvent(true, Enum.KeyCode.R, false, game) end
                     task.wait(0.1)
-                    VirtualInput:SendKeyEvent(false, Enum.KeyCode.R, false, game)
+                    if VirtualInput then VirtualInput:SendKeyEvent(false, Enum.KeyCode.R, false, game) end
                 end)
             end
         end
@@ -356,7 +458,7 @@ task.spawn(function()
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
         if not hrp then continue end
         
-        for _, v in pairs(workspace:GetDescendants()) do
+        for _, v in pairs(getWorkspaceDescendantsCached(false)) do
             if not v then continue end
             local name = v.Name
             if type(name) ~= "string" then continue end
@@ -434,7 +536,7 @@ task.spawn(function()
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
         if not hrp then continue end
         
-        for _, obj in pairs(Workspace:GetDescendants()) do
+        for _, obj in pairs(getWorkspaceDescendantsCached(false)) do
             if not obj then continue end
             local name = obj.Name
             if type(name) ~= "string" then continue end
@@ -471,7 +573,7 @@ task.spawn(function()
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
         if not hrp then continue end
         
-        for _, obj in pairs(Workspace:GetDescendants()) do
+        for _, obj in pairs(getWorkspaceDescendantsCached(false)) do
             if not obj then continue end
             local name = obj.Name
             if type(name) ~= "string" then continue end
@@ -501,7 +603,7 @@ task.spawn(function()
 end)
 
 local function checkOldBookInWorkspace()
-    for _, obj in pairs(Workspace:GetDescendants()) do
+    for _, obj in pairs(getWorkspaceDescendantsCached(false)) do
         if not obj then continue end
         local name = obj.Name
         if type(name) ~= "string" then continue end
@@ -653,7 +755,7 @@ local function buildLiveClusters()
         end
 
         if selectedCluster then
-            selectedCluster.Count += 1
+            selectedCluster.Count = selectedCluster.Count + 1
             selectedCluster.Center = selectedCluster.Center:Lerp(root.Position, 1 / selectedCluster.Count)
         else
             table.insert(clusters, {
@@ -952,7 +1054,14 @@ local function bringSpawnNPCs()
 
         BroughtNPCs[npc] = true
         pcall(function()
-            npc:PivotTo(targetCFrame)
+            if type(npc.PivotTo) == "function" then
+                npc:PivotTo(targetCFrame)
+            else
+                local _, root = getNPCParts(npc)
+                if root then
+                    root.CFrame = targetCFrame
+                end
+            end
         end)
     end
 
@@ -1117,7 +1226,11 @@ task.spawn(function()
         if playerRoot then
             pcall(function()
                 local targetPosition = root.Position + Vector3.new(0, 0, FarmDistance)
-                playerRoot.CFrame = CFrame.lookAt(targetPosition, root.Position)
+                if CFrame.lookAt then
+                    playerRoot.CFrame = CFrame.lookAt(targetPosition, root.Position)
+                else
+                    playerRoot.CFrame = CFrame.new(targetPosition, root.Position)
+                end
             end)
         end
 
@@ -1134,7 +1247,7 @@ end)
 task.spawn(function()
     while task.wait(0.2) do
         if not ChestEnabled then continue end
-        for _, v in ipairs(workspace:GetDescendants()) do
+        for _, v in ipairs(getWorkspaceDescendantsCached(false)) do
             if not ChestEnabled then break end
             if v and v.Name == "TreasureChest" and v:IsA("Model") then
                 local pos = v:FindFirstChild("Pos1", true) or v:FindFirstChild("PrimaryPart")
@@ -1292,8 +1405,8 @@ local function setupAntiAFK()
     if AntiAFKEnabled then
         afkConnection = Player.Idled:Connect(function()
             pcall(function()
-                VirtualUser:CaptureController()
-                VirtualUser:ClickButton2(Vector2.new())
+                if VirtualUser then VirtualUser:CaptureController() end
+                if VirtualUser then VirtualUser:ClickButton2(Vector2.new()) end
             end)
         end)
     end
@@ -1440,8 +1553,12 @@ local function toggleESP()
         ESPFolder.Name = "ESP_Players"
         ESPFolder.Parent = workspace
         if ESPConnection then ESPConnection:Disconnect() end
-        ESPConnection = RunService.RenderStepped:Connect(function()
+        local lastESPUpdate = 0
+        ESPConnection = RunService.Heartbeat:Connect(function()
             if not ESPEnabled then return end
+            local now = os.clock()
+            if now - lastESPUpdate < 0.5 then return end
+            lastESPUpdate = now
             for _, obj in pairs(ESPFolder:GetChildren()) do
                 pcall(function() obj:Destroy() end)
             end
@@ -1950,6 +2067,7 @@ local PlayerTab = Window:Tab({ Title = "Player", Icon = "lucide:users" })
 local QuestTab = Window:Tab({ Title = "Quest", Icon = "solar:crown-bold" })
 local MiscTab = Window:Tab({ Title = "Misc", Icon = "solar:settings-bold" })
 
+do
 local SpawnSection = FarmTab:Section({ Title = "Spawn Scanner", Opened = true })
 
 SpawnDropdown = SpawnSection:Dropdown({
@@ -2177,6 +2295,9 @@ SpawnSection:Slider({
 
 SpawnSection:Divider()
 
+end
+
+do
 local FarmSection = FarmTab:Section({ Title = "Auto Farm", Opened = true })
 
 FarmSection:Button({
@@ -2252,6 +2373,9 @@ FarmSection:Toggle({
 
 FarmSection:Divider()
 
+end
+
+do
 local BringSection = FarmTab:Section({ Title = "Auto Bring", Opened = true })
 
 BringSection:Toggle({
@@ -2281,6 +2405,9 @@ BringSection:Toggle({
     end
 })
 
+end
+
+do
 local ConfigSection = ConfigFarmTab:Section({ Title = "Auto Skill", Opened = true })
 
 ConfigSection:Toggle({
@@ -2310,6 +2437,9 @@ end
 
 ConfigFarmTab:Divider()
 
+end
+
+do
 local HakiSection = ConfigFarmTab:Section({ Title = "Auto Haki", Opened = true })
 
 HakiSection:Toggle({
@@ -2321,6 +2451,9 @@ HakiSection:Toggle({
     end
 })
 
+end
+
+do
 local IslandSection = TeleportTab:Section({ Title = "Islands", Opened = true })
 
 local IslandNamesList = {}
@@ -2343,6 +2476,9 @@ IslandSection:Dropdown({
 
 IslandSection:Divider()
 
+end
+
+do
 local DailySection = TeleportTab:Section({ Title = "Daily Quest", Opened = true })
 
 local DailyNames = {}
@@ -2365,6 +2501,9 @@ DailySection:Dropdown({
 
 DailySection:Divider()
 
+end
+
+do
 local ShopSection = TeleportTab:Section({ Title = "Shops", Opened = true })
 
 local ShopNames = {}
@@ -2387,6 +2526,9 @@ ShopSection:Dropdown({
 
 ShopSection:Divider()
 
+end
+
+do
 local QuestSectionTP = TeleportTab:Section({ Title = "Quest NPCs", Opened = true })
 
 local QuestNames = {}
@@ -2409,6 +2551,9 @@ QuestSectionTP:Dropdown({
 
 QuestSectionTP:Divider()
 
+end
+
+do
 local SecretSection = TeleportTab:Section({ Title = "Secret Locations", Opened = true })
 
 local SecretNames = {}
@@ -2431,6 +2576,9 @@ SecretSection:Dropdown({
 
 SecretSection:Divider()
 
+end
+
+do
 local SpecialSection = TeleportTab:Section({ Title = "Special", Opened = true })
 
 SpecialSection:Button({
@@ -2449,6 +2597,9 @@ SpecialSection:Button({
     end
 })
 
+end
+
+do
 local PlayersSection = PlayerTab:Section({ Title = "Player Control", Opened = true })
 
 mainPlayerDropdown = PlayersSection:Dropdown({
@@ -2533,6 +2684,9 @@ killToggleObj = PlayersSection:Toggle({
 
 PlayersSection:Divider()
 
+end
+
+do
 local UtilitySection = PlayerTab:Section({ Title = "Utility", Opened = true })
 
 flyToggleObj = UtilitySection:Toggle({
@@ -2582,6 +2736,9 @@ espToggleObj = UtilitySection:Toggle({
     end
 })
 
+end
+
+do
 local QuestSection = QuestTab:Section({ Title = "Haki Quest", Opened = true })
 
 QuestSection:Toggle({
@@ -2645,6 +2802,9 @@ QuestSection:Button({
 
 QuestSection:Divider()
 
+end
+
+do
 local FishingSection = QuestTab:Section({ Title = "Auto Fishing", Opened = true })
 
 FishingSection:Toggle({
@@ -2669,6 +2829,9 @@ FishingSection:Toggle({
     end
 })
 
+end
+
+do
 local MiscSection = MiscTab:Section({ Title = "Settings", Opened = true })
 
 MiscSection:Toggle({
@@ -2693,6 +2856,9 @@ MiscSection:Slider({
 
 MiscSection:Divider()
 
+end
+
+do
 local InfoSection = MiscTab:Section({ Title = "Info", Opened = true })
 
 InfoSection:Paragraph({
@@ -2706,21 +2872,39 @@ InfoSection:Button({
     Title = "Copy Discord Link",
     Icon = "copy",
     Callback = function()
-        setclipboard("https://discord.gg/faZagWVm72")
-        WindUI:Notify({ Title = "Copied!", Content = "Discord link copied", Duration = 2 })
+        if type(setclipboard) == "function" then
+            local ok = pcall(setclipboard, "https://discord.gg/faZagWVm72")
+            WindUI:Notify({
+                Title = ok and "Copied!" or "Clipboard unavailable",
+                Content = ok and "Discord link copied" or "https://discord.gg/faZagWVm72",
+                Duration = 3,
+            })
+        else
+            WindUI:Notify({
+                Title = "Discord",
+                Content = "https://discord.gg/faZagWVm72",
+                Duration = 5,
+            })
+        end
     end
 })
+
+end
 
 task.defer(function()
     task.wait(0.5)
     refreshSpawnList(false)
-    Window:Dialog({
-        Title = "Auto Spawn",
-        Content = "Farm > < Spawn >: choose a scanned spawn, enable Auto Spawn Farm, then enable Auto Bring NPCs if needed.",
-        Buttons = {
-            { Title = "OK", Variant = "Primary" },
-        },
-    })
+    pcall(function()
+        if Window and type(Window.Dialog) == "function" then
+            Window:Dialog({
+                Title = "Auto Spawn",
+                Content = "Farm > < Spawn >: choose a scanned spawn, enable Auto Spawn Farm, then enable Auto Bring NPCs if needed.",
+                Buttons = {
+                    { Title = "OK", Variant = "Primary" },
+                },
+            })
+        end
+    end)
 end)
 
 Players.PlayerAdded:Connect(function()
@@ -2859,7 +3043,11 @@ UserInputService.InputEnded:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
         if dragging and not moved then
             menuVisible = not menuVisible
-            if menuVisible then Window:Open() else Window:Close() end
+            if menuVisible then
+                if Window and type(Window.Open) == "function" then Window:Open() end
+            else
+                if Window and type(Window.Close) == "function" then Window:Close() end
+            end
         end
         dragging = false
         moved = false
