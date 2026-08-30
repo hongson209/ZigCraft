@@ -14135,8 +14135,16 @@ local function main()
     local hasFullSnapshot = false
     local lastFullSync = 0
     local lastDeepSync = 0
+    local liveRootsCache = nil
+    local liveRootsDirty = true
+    local sourceCache = setmetatable({}, {__mode = "k"})
+    local descendantsCache = setmetatable({}, {__mode = "k"})
+    local searchCache = {}
+    local liveRevision = 0
+    local submitSerial = 0
+    local composerHeight = 40
 
-    Codex.Version = "1.5.0"
+    Codex.Version = "1.6.0"
     Codex.Window = nil
     Codex.LastSnapshotStats = nil
 
@@ -14428,6 +14436,12 @@ local function main()
     end
 
     local function decompileScriptRaw(scr)
+        local cached = sourceCache[scr]
+        if cached then
+            if cached.ok then return cached.source, nil end
+            return nil, cached.error
+        end
+
         if not env.decompile or not env.isViableDecompileScript or not env.isViableDecompileScript(scr) then
             return nil, "source unavailable in current Dex environment"
         end
@@ -14436,7 +14450,10 @@ local function main()
         if not ok or type(source) ~= "string" or source == "" then
             return nil, sanitizeString(source or "decompile failed", 512)
         end
-        return sanitizeUtf8String(source), nil
+
+        source = sanitizeUtf8String(source)
+        sourceCache[scr] = {ok = true, source = source, bytes = #source}
+        return source, nil
     end
 
     -- Preview form used by selection/detail context. Full source is available through
@@ -14501,19 +14518,41 @@ local function main()
     end
 
     local function collectRoots(includeNil)
+        if includeNil ~= true and liveRootsCache and not liveRootsDirty then
+            return liveRootsCache
+        end
+
         local roots = {game}
         local ok, descendants = pcall(game.GetDescendants, game)
         if ok and type(descendants) == "table" then
             for i = 1, #descendants do roots[#roots + 1] = descendants[i] end
         end
+
         if includeNil and env.getnilinstances then
             local okNil, nils = pcall(env.getnilinstances)
             if okNil and type(nils) == "table" then
                 for i = 1, #nils do roots[#roots + 1] = nils[i] end
             end
+        elseif includeNil ~= true then
+            liveRootsCache = roots
+            liveRootsDirty = false
         end
         return roots
     end
+
+    -- Explorer can be very large. Do one cheap Instance-list build only when a live
+    -- query actually needs it, then reuse the list until Roblox changes the tree.
+    pcall(function()
+        local function markTreeDirty(obj)
+            liveRootsDirty = true
+            liveRevision += 1
+            table.clear(searchCache)
+            sourceCache[obj] = nil
+            descendantsCache[obj] = nil
+        end
+        game.DescendantAdded:Connect(markTreeDirty)
+        game.DescendantRemoving:Connect(markTreeDirty)
+    end)
 
     local function pageMeta(total, offset, count)
         local nextOffset = offset + count
@@ -14579,36 +14618,65 @@ local function main()
             local needle = string.lower(tostring(args.query or args.name or ""))
             local className = tostring(args.className or args.class or "")
             local serviceName = string.lower(tostring(args.service or ""))
-            local roots = collectRoots(args.includeNil == true)
-            local matches = {}
-            for i = 1, #roots do
-                local obj = roots[i]
-                local path = getPath(obj)
-                pathIndex[path] = obj
-                local nameMatch = needle == "" or string.find(string.lower(obj.Name), needle, 1, true) or string.find(string.lower(path), needle, 1, true)
-                local classMatch = safeIsA(obj, className)
-                local serviceMatch = serviceName == "" or string.lower(getTopServiceName(obj)) == serviceName
-                if nameMatch and classMatch and serviceMatch then matches[#matches + 1] = obj end
-                if i % 300 == 0 then task.wait() end
+            local cacheKey = table.concat({"instances", needle, string.lower(className), serviceName, args.includeNil == true and "nil" or "live", tostring(liveRevision)}, "|")
+            local matches = searchCache[cacheKey]
+            if not matches then
+                local roots = collectRoots(args.includeNil == true)
+                matches = {}
+                for i = 1, #roots do
+                    local obj = roots[i]
+                    local path = getPath(obj)
+                    pathIndex[path] = obj
+                    local nameMatch = needle == "" or string.find(string.lower(obj.Name), needle, 1, true) or string.find(string.lower(path), needle, 1, true)
+                    local classMatch = safeIsA(obj, className)
+                    local serviceMatch = serviceName == "" or string.lower(getTopServiceName(obj)) == serviceName
+                    if nameMatch and classMatch and serviceMatch then matches[#matches + 1] = obj end
+                    if i % 600 == 0 then task.wait() end
+                end
+                searchCache[cacheKey] = matches
             end
             local out = {}
             for i = offset + 1, math.min(#matches, offset + maxResults) do out[#out + 1] = basicInstanceRecord(matches[i]) end
             local meta = pageMeta(#matches, offset, #out)
             return {ok = true, count = meta.count, total = meta.total, offset = meta.offset, nextOffset = meta.nextOffset, hasMore = meta.hasMore, data = out}
+        elseif op == "get_mirror_status" then
+            return {
+                ok = true,
+                data = {
+                    fullSyncAt = lastFullSync,
+                    deepSyncAt = lastDeepSync,
+                    hasFullSnapshot = hasFullSnapshot,
+                    liveTreeDirty = liveRootsDirty,
+                },
+            }
+        elseif op == "refresh_live_index" then
+            liveRootsDirty = true
+            liveRootsCache = nil
+            liveRevision += 1
+            table.clear(searchCache)
+            descendantsCache = setmetatable({}, {__mode = "k"})
+            pathIndex = setmetatable({}, {__mode = "v"})
+            return {ok = true, refreshed = true, revision = liveRevision}
         elseif op == "get_scripts" then
             local needle = string.lower(tostring(args.query or ""))
             local serviceName = string.lower(tostring(args.service or ""))
-            local roots = collectRoots(args.includeNil == true)
-            local matches = {}
-            for i = 1, #roots do
-                local obj = roots[i]
-                if obj:IsA("LocalScript") or obj:IsA("ModuleScript") or obj:IsA("Script") then
-                    local path = getPath(obj)
-                    local qMatch = needle == "" or string.find(string.lower(obj.Name), needle, 1, true) or string.find(string.lower(path), needle, 1, true)
-                    local serviceMatch = serviceName == "" or string.lower(getTopServiceName(obj)) == serviceName
-                    if qMatch and serviceMatch then matches[#matches + 1] = obj end
+            local cacheKey = table.concat({"scripts", needle, serviceName, args.includeNil == true and "nil" or "live", tostring(liveRevision)}, "|")
+            local matches = searchCache[cacheKey]
+            if not matches then
+                local roots = collectRoots(args.includeNil == true)
+                matches = {}
+                for i = 1, #roots do
+                    local obj = roots[i]
+                    if obj:IsA("LocalScript") or obj:IsA("ModuleScript") or obj:IsA("Script") then
+                        local path = getPath(obj)
+                        pathIndex[path] = obj
+                        local qMatch = needle == "" or string.find(string.lower(obj.Name), needle, 1, true) or string.find(string.lower(path), needle, 1, true)
+                        local serviceMatch = serviceName == "" or string.lower(getTopServiceName(obj)) == serviceName
+                        if qMatch and serviceMatch then matches[#matches + 1] = obj end
+                    end
+                    if i % 600 == 0 then task.wait() end
                 end
-                if i % 300 == 0 then task.wait() end
+                searchCache[cacheKey] = matches
             end
             local out = {}
             for i = offset + 1, math.min(#matches, offset + maxResults) do
@@ -14660,8 +14728,16 @@ local function main()
             local meta = pageMeta(#children, offset, #out)
             return {ok = true, path = getPath(obj), count = meta.count, total = meta.total, offset = meta.offset, nextOffset = meta.nextOffset, hasMore = meta.hasMore, data = out}
         elseif op == "get_descendants" then
-            local okDesc, descendants = pcall(obj.GetDescendants, obj)
-            if not okDesc then return queryError(descendants) end
+            local cachedDesc = descendantsCache[obj]
+            local descendants
+            if cachedDesc and cachedDesc.revision == liveRevision then
+                descendants = cachedDesc.data
+            else
+                local okDesc, fetched = pcall(obj.GetDescendants, obj)
+                if not okDesc then return queryError(fetched) end
+                descendants = fetched
+                descendantsCache[obj] = {revision = liveRevision, data = descendants}
+            end
             local out = {}
             for i = offset + 1, math.min(#descendants, offset + maxResults) do
                 out[#out + 1] = basicInstanceRecord(descendants[i])
@@ -14716,7 +14792,7 @@ local function main()
         return out
     end
 
-    function Codex.BuildSelectionContext()
+    function Codex.BuildSelectionContext(includeDetails, includeSource)
         local selected = {}
         local selectionList = Explorer and Explorer.Selection and Explorer.Selection.List or {}
         local maxSelected = math.min(#selectionList, tonumber(cfg("MaxSelectedInstances", 20)) or 20)
@@ -14725,15 +14801,24 @@ local function main()
             local node = selectionList[i]
             local obj = node and node.Obj
             if obj then
-                selected[#selected + 1] = detailedInstanceRecord(obj, true)
+                if includeDetails == true then
+                    selected[#selected + 1] = detailedInstanceRecord(obj, includeSource == true)
+                else
+                    local record = basicInstanceRecord(obj)
+                    local okChildren, children = pcall(obj.GetChildren, obj)
+                    if okChildren then record.childCount = #children end
+                    record.isScript = obj:IsA("LocalScript") or obj:IsA("ModuleScript") or obj:IsA("Script")
+                    selected[#selected + 1] = record
+                end
             end
         end
 
         return {
-            schema = "dexpp.selection.v1",
+            schema = "dexpp.selection.v2",
             timestamp = os.time(),
             placeId = game.PlaceId,
             jobId = game.JobId,
+            detailed = includeDetails == true,
             selectedCount = #selected,
             selected = selected,
         }
@@ -15115,15 +15200,49 @@ local function main()
         return true, mirrorResult
     end
 
+    local function splitDisplayText(text, chunkSize)
+        local out = {}
+        chunkSize = chunkSize or 3500
+        if text == "" then return {""} end
+        local cursor = 1
+        while cursor <= #text do
+            local stop = math.min(#text, cursor + chunkSize - 1)
+            if stop < #text then
+                local probe = text:sub(cursor, stop)
+                local newline = probe:match(".*()\n")
+                if newline and newline > math.floor(chunkSize * 0.55) then
+                    stop = cursor + newline - 2
+                end
+            end
+            out[#out + 1] = text:sub(cursor, stop)
+            cursor = stop + 1
+        end
+        return out
+    end
+
+    local function scrollMessagesToBottom()
+        if not messages then return end
+        task.defer(function()
+            task.wait()
+            messages.CanvasPosition = Vector2.new(0, math.max(0, messages.AbsoluteCanvasSize.Y - messages.AbsoluteWindowSize.Y))
+        end)
+    end
+
     local function addMessage(role, text)
         if not messages then return end
-        text = sanitizeString(text, tonumber(cfg("MaxChatMessageLength", 24000)) or 24000)
+        text = sanitizeString(text, tonumber(cfg("MaxChatDisplayLength", 60000)) or 60000)
 
         local holder = Instance.new("Frame")
         holder.BackgroundTransparency = 1
-        holder.Size = UDim2.new(1, -10, 0, 10)
+        holder.Size = UDim2.new(1, -10, 0, 1)
         holder.AutomaticSize = Enum.AutomaticSize.Y
         holder.Parent = messages
+
+        local layout = Instance.new("UIListLayout")
+        layout.FillDirection = Enum.FillDirection.Vertical
+        layout.SortOrder = Enum.SortOrder.LayoutOrder
+        layout.Padding = UDim.new(0, 2)
+        layout.Parent = holder
 
         local roleLabel = Instance.new("TextLabel")
         roleLabel.BackgroundTransparency = 1
@@ -15134,26 +15253,28 @@ local function main()
         roleLabel.TextColor3 = role == "You" and Color3.fromRGB(125, 190, 255) or Color3.fromRGB(130, 225, 160)
         roleLabel.Text = role
         roleLabel.Size = UDim2.new(1, 0, 0, 18)
+        roleLabel.LayoutOrder = 1
         roleLabel.Parent = holder
 
-        local body = Instance.new("TextLabel")
-        body.BackgroundTransparency = 1
-        body.Font = Enum.Font.Code
-        body.TextSize = 13
-        body.TextWrapped = true
-        body.RichText = false
-        body.TextXAlignment = Enum.TextXAlignment.Left
-        body.TextYAlignment = Enum.TextYAlignment.Top
-        body.TextColor3 = Settings.Theme.Text
-        body.Text = text
-        body.Position = UDim2.new(0, 0, 0, 18)
-        body.Size = UDim2.new(1, 0, 0, 10)
-        body.AutomaticSize = Enum.AutomaticSize.Y
-        body.Parent = holder
+        local chunks = splitDisplayText(text, tonumber(cfg("ChatRenderChunkChars", 3500)) or 3500)
+        for i = 1, #chunks do
+            local body = Instance.new("TextLabel")
+            body.BackgroundTransparency = 1
+            body.Font = Enum.Font.Code
+            body.TextSize = 13
+            body.TextWrapped = true
+            body.RichText = false
+            body.TextXAlignment = Enum.TextXAlignment.Left
+            body.TextYAlignment = Enum.TextYAlignment.Top
+            body.TextColor3 = Settings.Theme.Text
+            body.Text = chunks[i]
+            body.Size = UDim2.new(1, 0, 0, 1)
+            body.AutomaticSize = Enum.AutomaticSize.Y
+            body.LayoutOrder = i + 1
+            body.Parent = holder
+        end
 
-        task.defer(function()
-            messages.CanvasPosition = Vector2.new(0, math.max(0, messages.AbsoluteCanvasSize.Y))
-        end)
+        scrollMessagesToBottom()
     end
 
     local function addChoiceButtons(choices)
@@ -15218,7 +15339,7 @@ local function main()
             if provider == "Freebuff" then
                 inputBox.PlaceholderText = "Stage a request for Freebuff about @selection or the full Dex mirror..."
             else
-                inputBox.PlaceholderText = "Ask Codex about @selection or the synced Dex tree..."
+                inputBox.PlaceholderText = "Ask Codex about @selection or the live Dex Explorer..."
             end
         end
         if sendButton then
@@ -15266,23 +15387,37 @@ local function main()
         addMessage("You", message)
 
         local ttl = tonumber(cfg("FullSnapshotTTL", 300)) or 300
-        if cfg("AutoDeepSyncFreebuff", true) == true and (lastDeepSync == 0 or (os.time() - lastDeepSync) > ttl) then
-            setStatus("Freebuff: refreshing full Explorer + script mirror...", nil)
-            local mirrorOk, mirrorResult = Codex.SyncExplorerMirror(true, true)
+        local lowerMessage = string.lower(message)
+        local sourceWords = {"script", "module", "source", "luau", "lua", "code", "localscript", "modulescript", "mã nguồn", "đọc mã", "remote", "function"}
+        local needsSources = false
+        for i = 1, #sourceWords do
+            if string.find(lowerMessage, sourceWords[i], 1, true) then needsSources = true break end
+        end
+
+        -- Freebuff cannot call the live Dex protocol, so it needs a disk mirror. Keep
+        -- that mirror lazy too: metadata-only for normal Explorer questions, and only
+        -- decompile/export all readable sources when the request actually concerns code.
+        local mirrorStale = lastFullSync == 0 or (os.time() - lastFullSync) > ttl
+        local deepStale = lastDeepSync == 0 or (os.time() - lastDeepSync) > ttl
+        if mirrorStale or (needsSources and deepStale) then
+            setStatus(needsSources and "Freebuff: exporting Explorer + readable sources..." or "Freebuff: exporting Explorer metadata...", nil)
+            local mirrorOk, mirrorResult = Codex.SyncExplorerMirror(needsSources, false)
             if mirrorOk then
                 hasFullSnapshot = true
                 lastFullSync = os.time()
-                lastDeepSync = lastFullSync
+                if needsSources then lastDeepSync = lastFullSync end
                 local instances = type(mirrorResult) == "table" and mirrorResult.instances or "all"
                 local scripts = type(mirrorResult) == "table" and mirrorResult.scripts or 0
-                addMessage("Freebuff", "Full trusted mirror refreshed: " .. tostring(instances) .. " instances, " .. tostring(scripts) .. " readable script sources.")
+                addMessage("Freebuff", needsSources
+                    and ("Source mirror ready: " .. tostring(instances) .. " instances, " .. tostring(scripts) .. " readable script sources.")
+                    or ("Explorer metadata mirror ready: " .. tostring(instances) .. " instances."))
             else
-                addMessage("Freebuff", "Deep mirror refresh warning: " .. tostring(mirrorResult) .. ". I will still stage the request using the latest available mirror.")
+                addMessage("Freebuff", "Mirror refresh warning: " .. tostring(mirrorResult) .. ". I will still stage the request using the latest available mirror.")
             end
         end
 
         setStatus("Syncing selection for Freebuff...", nil)
-        local selection = Codex.BuildSelectionContext()
+        local selection = Codex.BuildSelectionContext(true, false)
         local syncOk, syncErr = syncPayload("selection", selection)
         if not syncOk then
             addMessage("Freebuff", "Selection sync warning: " .. tostring(syncErr) .. ". The full disk mirror remains usable if Deep Sync succeeded.")
@@ -15297,7 +15432,7 @@ local function main()
 
         if ok then
             local promptFile = type(result) == "table" and tostring(result.file or "FREEBUFF_REQUEST.md") or "FREEBUFF_REQUEST.md"
-            addMessage("Freebuff", "Request staged in " .. promptFile .. ". Freebuff uses the same trusted Dex mirror. Press Open Freebuff, then ask it to read FREEBUFF_REQUEST.md (knowledge.md already explains the mirror layout).")
+            addMessage("Freebuff", "Request staged in " .. promptFile .. ". Freebuff uses the same trusted Dex mirror. Press Open Freebuff, then ask it to read FREEBUFF_REQUEST.md (DEX_SKILL.md explains the mirror only if Freebuff needs it).")
             setStatus("Freebuff request staged", true)
         else
             addMessage("Freebuff", "Could not stage request: " .. tostring(result))
@@ -15330,64 +15465,31 @@ local function main()
 
         addMessage("You", message)
 
-        local ttl = tonumber(cfg("FullSnapshotTTL", 300)) or 300
-        local lowerMessage = string.lower(message)
-        local sourceWords = {"script", "module", "source", "luau", "lua", "code", "localscript", "modulescript", "mã nguồn", "đọc mã"}
-        local wantsDeep = false
-        if cfg("AutoDeepSyncCodexForScriptQueries", true) == true then
-            for i = 1, #sourceWords do
-                if string.find(lowerMessage, sourceWords[i], 1, true) then wantsDeep = true break end
-            end
+        -- Lazy Read mode: never full/deep-sync the 60k+ Explorer just because a
+        -- chat message was sent. Only a tiny current-selection hint is attached. Codex
+        -- requests exactly the live Dex data it needs through DEX_QUERY/DEX_QUERIES.
+        -- Full Sync / Deep Sync remain explicit buttons for disk-mirror/Freebuff use.
+        setStatus("Preparing live Dex context...", nil)
+        local selection = Codex.BuildSelectionContext(false, false)
+        local selectionHint = {}
+        for i = 1, math.min(selection.selectedCount or 0, 8) do
+            local item = selection.selected[i]
+            selectionHint[#selectionHint + 1] = {
+                path = item.path,
+                name = item.name,
+                className = item.className,
+                childCount = item.childCount,
+                isScript = item.isScript,
+            }
         end
 
-        if wantsDeep and (lastDeepSync == 0 or (os.time() - lastDeepSync) > ttl) then
-            setStatus("Refreshing full Explorer + script source mirror...", nil)
-            local mirrorOk, mirrorResult = Codex.SyncExplorerMirror(true, true)
-            if mirrorOk then
-                hasFullSnapshot = true
-                lastFullSync = os.time()
-                lastDeepSync = lastFullSync
-            else
-                addMessage("Codex", "Deep mirror refresh warning: " .. tostring(mirrorResult) .. ". Live Dex queries remain available.")
-            end
-        elseif cfg("AutoMirrorBeforeCodexChat", true) == true and (lastFullSync == 0 or (os.time() - lastFullSync) > ttl) then
-            setStatus("Refreshing full Explorer metadata mirror...", nil)
-            local mirrorOk, mirrorResult = Codex.SyncExplorerMirror(false, false)
-            if mirrorOk then
-                hasFullSnapshot = true
-                lastFullSync = os.time()
-            else
-                addMessage("Codex", "Full mirror refresh warning: " .. tostring(mirrorResult) .. ". Live Dex queries remain available.")
-            end
-        end
-
-        setStatus("Syncing selected Dex context...", nil)
-        local selection = Codex.BuildSelectionContext()
-        local syncOk, syncErr = syncPayload("selection", selection)
-        if not syncOk then
-            addMessage("Codex", "Cannot sync Dex context: " .. tostring(syncErr))
-            setStatus("Bridge unavailable", false)
-            busy = false
-            if sendButton then sendButton.Text = "Send" sendButton.Active = true end
-            return
-        end
-
-        if not hasFullSnapshot or (os.time() - lastFullSync) > (tonumber(cfg("FullSnapshotTTL", 300)) or 300) then
-            -- Keep chat responsive: send a metadata-only full snapshot automatically.
-            local snapshot = Codex.BuildFullSnapshot(false)
-            local fullOk = syncPayload("full", snapshot)
-            if fullOk then
-                hasFullSnapshot = true
-                lastFullSync = os.time()
-            end
-        end
-
-        setStatus("Codex is thinking...", nil)
+        setStatus("Codex: reading only what this request needs...", nil)
         local ok, result = requestBridge("/chat", "POST", {
             message = message,
             placeId = game.PlaceId,
             jobId = game.JobId,
             selectedCount = selection.selectedCount,
+            selectionHint = selectionHint,
         })
 
         if ok then
@@ -15617,7 +15719,7 @@ local function main()
         contextLabel.TextSize = 12
         contextLabel.TextXAlignment = Enum.TextXAlignment.Left
         contextLabel.TextColor3 = Settings.Theme.PlaceholderText
-        contextLabel.Text = "Sync Dex = ALL Explorer to trusted folder | Deep Sync = + properties + accessible script sources"
+        contextLabel.Text = "Lazy Read ON | Sync/Deep Sync are manual exports; chat reads live Dex on demand"
         contextLabel.Position = UDim2.new(0, 8, 0, 67)
         contextLabel.Size = UDim2.new(1, -16, 0, 18)
         contextLabel.Parent = content
@@ -15683,10 +15785,26 @@ local function main()
         local sendCorner = Instance.new("UICorner", sendButton)
         sendCorner.CornerRadius = UDim.new(0, 4)
 
+        local function updateComposerSize()
+            if not inputBox or not inputFrame or not messages then return end
+            local width = math.max(120, inputBox.AbsoluteSize.X)
+            local sample = inputBox.Text ~= "" and inputBox.Text or " "
+            local okBounds, bounds = pcall(service.TextService.GetTextSize, service.TextService, sample .. "\n", inputBox.TextSize, inputBox.Font, Vector2.new(width, 10000))
+            local needed = okBounds and math.ceil(bounds.Y + 18) or 40
+            composerHeight = math.clamp(needed, 40, tonumber(cfg("ComposerMaxHeight", 118)) or 118)
+            inputFrame.Position = UDim2.new(0, 6, 1, -(composerHeight + 6))
+            inputFrame.Size = UDim2.new(1, -12, 0, composerHeight)
+            messages.Size = UDim2.new(1, -12, 1, -(100 + composerHeight))
+        end
+
+        inputBox:GetPropertyChangedSignal("Text"):Connect(updateComposerSize)
+        inputBox:GetPropertyChangedSignal("AbsoluteSize"):Connect(updateComposerSize)
+        task.defer(updateComposerSize)
+
         codexProviderButton.MouseButton1Click:Connect(function()
             if busy then return end
             Codex.SetProvider("Codex")
-            contextLabel.Text = "Codex: embedded chat + dynamic Dex queries | Sync/Deep Sync mirror the full Explorer"
+            contextLabel.Text = "Codex: Lazy Read ON | reads Explorer/properties/source only when your request needs them"
         end)
 
         freebuffProviderButton.MouseButton1Click:Connect(function()
@@ -15695,19 +15813,43 @@ local function main()
             contextLabel.Text = "Freebuff: trusted-folder mode | Sync/Deep Sync mirrors ALL Explorer; Open Freebuff launches it in that folder"
         end)
 
-        local function submit()
-            local message = inputBox.Text
+        local function submit(explicitText)
+            local message = explicitText or inputBox.Text
+            message = tostring(message or ""):gsub("[\r\n]+$", ""):match("^%s*(.-)%s*$") or ""
             if message == "" then return end
+            if busy then return end
+
+            submitSerial += 1
+            local mySerial = submitSerial
             inputBox.Text = ""
-            task.spawn(function()
-                Codex.Ask(message)
+            task.defer(function()
+                if inputBox and inputBox.Parent and mySerial == submitSerial then
+                    inputBox:CaptureFocus()
+                end
             end)
+            task.spawn(function() Codex.Ask(message) end)
         end
 
-        sendButton.MouseButton1Click:Connect(submit)
+        sendButton.MouseButton1Click:Connect(function() submit() end)
+
+        -- MultiLine TextBox does not reliably fire FocusLost on Enter. Handle the
+        -- keyboard directly: Enter sends, Shift+Enter inserts a new line.
+        service.UserInputService.InputBegan:Connect(function(input, processed)
+            if not inputBox or not inputBox:IsFocused() then return end
+            if input.KeyCode ~= Enum.KeyCode.Return then return end
+            local shift = service.UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) or service.UserInputService:IsKeyDown(Enum.KeyCode.RightShift)
+            if shift then return end
+
+            local message = inputBox.Text
+            inputBox:ReleaseFocus()
+            task.defer(function() submit(message) end)
+        end)
+
+        -- Fallback for executors/clients that still release focus on Return.
         inputBox.FocusLost:Connect(function(enterPressed)
-            if enterPressed and not service.UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) and not service.UserInputService:IsKeyDown(Enum.KeyCode.RightShift) then
-                submit()
+            if enterPressed then
+                local shift = service.UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) or service.UserInputService:IsKeyDown(Enum.KeyCode.RightShift)
+                if not shift and inputBox.Text ~= "" then submit() end
             end
         end)
 
@@ -15738,7 +15880,7 @@ local function main()
             end)
         end
 
-        addMessage("AI", "Dex++ AI Assistant v1.5 loaded. Codex can read the complete synced Explorer and query live Dex in paginated/batched steps; Freebuff uses the same trusted full mirror. Deep Sync exports properties and complete readable script sources in source chunks. Safe Dex UI navigation can be performed when explicitly requested.")
+        addMessage("AI", "Dex++ AI Assistant v1.6 ready. Lazy Read is ON: Codex does not scan/decompile the full Explorer before every message. It requests only the objects, properties and scripts needed for your current request. Use Sync/Deep Sync only when you explicitly want a disk mirror or Freebuff workspace.")
         updateProviderVisuals()
         task.spawn(Codex.Health)
         -- Keep status live. This fixes the confusing case where Freebuff is launched
@@ -15892,14 +16034,17 @@ DefaultSettings = (function()
 			MaxChildrenInDetail = 300,
 			MaxSourceLength = 60000,
 			MaxStringLength = 32768,
-			MaxChatMessageLength = 24000,
+			MaxChatMessageLength = 120000,
+			MaxChatDisplayLength = 60000,
+			ChatRenderChunkChars = 3500,
+			ComposerMaxHeight = 118,
 			FullSnapshotTTL = 300,
-			MaxToolHops = 12,
+			MaxToolHops = 14,
 			MaxToolBatch = 8,
 			MaxToolPageSize = 500,
-			ToolSourceChunkBytes = 48000,
-			AutoMirrorBeforeCodexChat = true,
-			AutoDeepSyncCodexForScriptQueries = true,
+			ToolSourceChunkBytes = 32000,
+			AutoMirrorBeforeCodexChat = false, -- V6 Lazy Read
+			AutoDeepSyncCodexForScriptQueries = false, -- source is requested only when needed
 			AutoDeepSyncFreebuff = true,
 			MirrorChunkSize = 40,
 			MirrorSourceChunkBytes = 48000,
