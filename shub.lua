@@ -4,7 +4,7 @@
 	
 	Developed by Chillz
 	
-	Sondeptrai
+	cac
 ]]
 
 local selection
@@ -14134,7 +14134,7 @@ local function main()
     local hasFullSnapshot = false
     local lastFullSync = 0
 
-    Codex.Version = "1.1.0"
+    Codex.Version = "1.2.0"
     Codex.Window = nil
     Codex.LastSnapshotStats = nil
 
@@ -14671,8 +14671,8 @@ local function main()
 
     function Codex.BuildFullSnapshot(includeSources)
         local started = os.clock()
-        local maxInstances = tonumber(cfg("MaxInstances", 12000)) or 12000
-        local maxScripts = tonumber(cfg("MaxScripts", 250)) or 250
+        local maxInstances = tonumber(cfg("CompactContextMaxInstances", 2500)) or 2500
+        local maxScripts = tonumber(cfg("CompactContextMaxScripts", 0)) or 0
         local instances = {}
         local scripts = {}
         local truncated = false
@@ -14763,41 +14763,65 @@ local function main()
         if busy then return false, "busy" end
         busy = true
 
-        -- First keep the compact context used by the embedded Codex chat.
-        setStatus(includeSources and "Building deep Dex context..." or "Building Dex context...", nil)
-        local snapshot = Codex.BuildFullSnapshot(includeSources)
-        local contextOk, contextResult = syncPayload("full", snapshot)
-        if not contextOk then
-            setStatus("Context sync failed: " .. tostring(contextResult), false)
-            busy = false
-            return false, contextResult
-        end
-
-        -- Then mirror the ENTIRE Explorer to the trusted disk workspace.
-        -- Sync Dex = full tree/attributes/tags; Deep Sync = + readable properties + accessible sources.
+        -- IMPORTANT: the disk mirror is the source of truth for BOTH providers.
+        -- Mirror first and never block a full Explorer sync just because the optional
+        -- compact Codex chat snapshot fails (large executors often reject a big /sync body).
         setStatus(includeSources and "Deep mirroring full Explorer..." or "Mirroring full Explorer...", nil)
         local mirrorOk, mirrorResult = Codex.SyncExplorerMirror(includeSources == true, includeSources == true)
+        if not mirrorOk then
+            setStatus("Mirror failed: " .. tostring(mirrorResult), false)
+            busy = false
+            return false, mirrorResult
+        end
 
-        if mirrorOk then
-            hasFullSnapshot = true
-            lastFullSync = os.time()
-            local stats = Codex.LastSnapshotStats
-            local mirrored = type(mirrorResult) == "table" and tonumber(mirrorResult.instances) or nil
-            local mirroredScripts = type(mirrorResult) == "table" and tonumber(mirrorResult.scripts) or nil
+        hasFullSnapshot = true
+        lastFullSync = os.time()
+        local mirrored = type(mirrorResult) == "table" and tonumber(mirrorResult.instances) or nil
+        local mirroredScripts = type(mirrorResult) == "table" and tonumber(mirrorResult.scripts) or nil
+
+        -- Freebuff reads the trusted disk workspace directly, so there is no reason to
+        -- build/send a second huge compact snapshot. Keep only current selection fresh.
+        if provider == "Freebuff" then
+            local selectionOk, selectionResult = Codex.SyncSelection()
             contextLabel.Text = string.format(
-                "Explorer mirror: %s instances | %s scripts | compact context: %d%s",
+                "Freebuff mirror ready: %s instances | %s scripts | workspace synced",
                 tostring(mirrored or "all"),
-                tostring(mirroredScripts or (includeSources and stats.scripts or 0)),
-                stats.instances,
-                stats.truncated and " (chat snapshot capped; disk mirror is not)" or ""
+                tostring(mirroredScripts or 0)
             )
+            if selectionOk then
+                setStatus(includeSources and "Deep Explorer mirror ready for Freebuff" or "Explorer mirror ready for Freebuff", true)
+            else
+                setStatus("Explorer mirror ready; selection sync warning: " .. tostring(selectionResult), nil)
+            end
+            busy = false
+            return true, mirrorResult
+        end
+
+        -- Codex embedded chat gets a SMALL best-effort snapshot. Full data remains on disk
+        -- under dex/, which Codex can read directly from its trusted workspace.
+        setStatus("Mirror ready; preparing compact Codex chat context...", nil)
+        local snapshot = Codex.BuildFullSnapshot(false)
+        local contextOk, contextResult = syncPayload("full", snapshot)
+        local stats = Codex.LastSnapshotStats or {instances = 0, scripts = 0, truncated = false}
+
+        contextLabel.Text = string.format(
+            "Explorer mirror: %s instances | %s scripts | compact chat context: %d%s",
+            tostring(mirrored or "all"),
+            tostring(mirroredScripts or 0),
+            tonumber(stats.instances) or 0,
+            stats.truncated and " (capped; disk mirror is full)" or ""
+        )
+
+        if contextOk then
             setStatus(includeSources and "Deep Explorer mirror ready" or "Explorer mirror ready", true)
         else
-            setStatus("Mirror failed: " .. tostring(mirrorResult), false)
+            -- Do NOT fail the sync. Codex can still read dex/tree.txt, instances.jsonl,
+            -- services/*.jsonl and scripts/*.luau from the trusted workspace.
+            setStatus("Explorer mirror ready; compact chat context skipped", true)
         end
 
         busy = false
-        return mirrorOk, mirrorResult
+        return true, mirrorResult
     end
 
     local function addMessage(role, text)
@@ -15402,8 +15426,10 @@ DefaultSettings = (function()
 			_Recurse = true,
 			Provider = "Codex",
 			BridgeUrl = "http://127.0.0.1:32187",
-			MaxInstances = 12000,
+			MaxInstances = 12000, -- legacy compact cap; disk mirror itself is uncapped
 			MaxScripts = 250,
+			CompactContextMaxInstances = 2500,
+			CompactContextMaxScripts = 0, -- sources live in dex/scripts/*.luau after Deep Sync
 			MaxPropertiesPerInstance = 160,
 			MaxSelectedInstances = 20,
 			MaxChildrenInDetail = 300,
