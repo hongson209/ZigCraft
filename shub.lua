@@ -4,7 +4,7 @@
 	
 	Developed by Chillz
 	
-	Dex++ is a revival of Moon's Dex, made to fulfill Moon's Dex prophecy.
+	Sondeptrai
 ]]
 
 local selection
@@ -14126,7 +14126,10 @@ local function main()
     local window
     local statusLabel, contextLabel, messages, inputBox, sendButton
     local syncButton, deepSyncButton, newThreadButton
+    local codexProviderButton, freebuffProviderButton
     local busy = false
+    local provider = tostring((Settings.Codex and Settings.Codex.Provider) or "Codex")
+    if provider ~= "Freebuff" then provider = "Codex" end
     local pathIndex = setmetatable({}, {__mode = "v"})
     local hasFullSnapshot = false
     local lastFullSync = 0
@@ -14838,9 +14841,105 @@ local function main()
         end)
     end
 
+    local function currentProvider()
+        return provider == "Freebuff" and "Freebuff" or "Codex"
+    end
+
+    local function updateProviderVisuals()
+        if codexProviderButton then
+            codexProviderButton.BackgroundColor3 = provider == "Codex" and Settings.Theme.ListSelection or Settings.Theme.Button
+        end
+        if freebuffProviderButton then
+            freebuffProviderButton.BackgroundColor3 = provider == "Freebuff" and Settings.Theme.ListSelection or Settings.Theme.Button
+        end
+        if inputBox then
+            if provider == "Freebuff" then
+                inputBox.PlaceholderText = "Stage a request for Freebuff about @selection or the full Dex mirror..."
+            else
+                inputBox.PlaceholderText = "Ask Codex about @selection or the synced Dex tree..."
+            end
+        end
+        if sendButton then
+            sendButton.Text = provider == "Freebuff" and "Stage" or "Send"
+        end
+        if newThreadButton then
+            newThreadButton.Text = provider == "Freebuff" and "Open Freebuff" or "New Chat"
+        end
+        if window then
+            window:SetTitle("AI Assistant - " .. currentProvider())
+        end
+    end
+
+    function Codex.SetProvider(name)
+        provider = tostring(name) == "Freebuff" and "Freebuff" or "Codex"
+        Settings.Codex = Settings.Codex or {}
+        Settings.Codex.Provider = provider
+        updateProviderVisuals()
+        if provider == "Freebuff" then
+            setStatus("Checking Freebuff...", nil)
+            task.spawn(function() Codex.Health() end)
+        else
+            setStatus("Checking Codex...", nil)
+            task.spawn(function() Codex.Health() end)
+        end
+    end
+
+    function Codex.StageFreebuffPrompt(message)
+        message = tostring(message or ""):match("^%s*(.-)%s*$") or ""
+        if message == "" then return end
+        if busy then
+            addMessage("Freebuff", "A sync/request is already running.")
+            return
+        end
+
+        busy = true
+        if sendButton then
+            sendButton.Text = "..."
+            sendButton.Active = false
+        end
+
+        addMessage("You", message)
+        setStatus("Syncing selection for Freebuff...", nil)
+
+        local selection = Codex.BuildSelectionContext()
+        local syncOk, syncErr = syncPayload("selection", selection)
+        if not syncOk then
+            addMessage("Freebuff", "Cannot sync Dex context: " .. tostring(syncErr))
+            setStatus("Bridge unavailable", false)
+            busy = false
+            if sendButton then sendButton.Text = "Stage" sendButton.Active = true end
+            return
+        end
+
+        local ok, result = requestBridge("/freebuff/prompt", "POST", {
+            message = message,
+            placeId = game.PlaceId,
+            jobId = game.JobId,
+            selectedCount = selection.selectedCount,
+        })
+
+        if ok then
+            local promptFile = type(result) == "table" and tostring(result.file or "FREEBUFF_REQUEST.md") or "FREEBUFF_REQUEST.md"
+            addMessage("Freebuff", "Request staged in " .. promptFile .. ". Freebuff uses the same trusted Dex mirror. Press Open Freebuff, then ask it to read FREEBUFF_REQUEST.md (knowledge.md already explains the mirror layout).")
+            setStatus("Freebuff request staged", true)
+        else
+            addMessage("Freebuff", "Could not stage request: " .. tostring(result))
+            setStatus("Freebuff staging failed", false)
+        end
+
+        busy = false
+        if sendButton then
+            sendButton.Text = "Stage"
+            sendButton.Active = true
+        end
+    end
+
     function Codex.Ask(message)
         message = tostring(message or ""):match("^%s*(.-)%s*$") or ""
         if message == "" then return end
+        if provider == "Freebuff" then
+            return Codex.StageFreebuffPrompt(message)
+        end
         if busy then
             addMessage("Codex", "A request is already running.")
             return
@@ -14933,6 +15032,21 @@ local function main()
     end
 
     function Codex.Health()
+        if provider == "Freebuff" then
+            local ok, result = requestBridge("/freebuff/status", "GET")
+            if ok then
+                local installed = type(result) == "table" and result.installed
+                if installed then
+                    setStatus("Bridge online / Freebuff installed", true)
+                else
+                    setStatus("Bridge online / Freebuff not found", false)
+                end
+            else
+                setStatus("Bridge offline: " .. tostring(result), false)
+            end
+            return ok, result
+        end
+
         local ok, result = requestBridge("/health", "GET")
         if ok then
             local ready = type(result) == "table" and result.ready
@@ -14948,6 +15062,18 @@ local function main()
     end
 
     function Codex.NewThread()
+        if provider == "Freebuff" then
+            local ok, result = requestBridge("/freebuff/open", "POST", {})
+            if ok then
+                addMessage("Freebuff", "Opened Freebuff in the trusted Dex mirror workspace. It can read dex/tree.txt, dex/instances.jsonl, dex/services/* and dex/scripts/* from the latest Sync/Deep Sync.")
+                setStatus("Freebuff opened", true)
+            else
+                addMessage("Freebuff", "Could not open Freebuff: " .. tostring(result))
+                setStatus("Freebuff launch failed", false)
+            end
+            return ok, result
+        end
+
         local ok, result = requestBridge("/new-thread", "POST", {})
         if ok then
             addMessage("Codex", "Started a new Codex thread. Dex context is preserved on the bridge.")
@@ -14959,7 +15085,7 @@ local function main()
         return ok, result
     end
 
-    local function makeButton(parent, text, x, width)
+    local function makeButton(parent, text, x, width, y, height)
         local button = Instance.new("TextButton")
         button.AutoButtonColor = false
         button.BackgroundColor3 = Settings.Theme.Button
@@ -14968,20 +15094,28 @@ local function main()
         button.TextSize = 13
         button.TextColor3 = Settings.Theme.Text
         button.Text = text
-        button.Position = UDim2.new(0, x, 0, 0)
-        button.Size = UDim2.new(0, width, 1, 0)
+        button.Position = UDim2.new(0, x, 0, y or 0)
+        button.Size = UDim2.new(0, width, 0, height or 24)
         button.Parent = parent
         local corner = Instance.new("UICorner")
         corner.CornerRadius = UDim.new(0, 4)
         corner.Parent = button
         button.MouseEnter:Connect(function() button.BackgroundColor3 = Settings.Theme.ButtonHover end)
-        button.MouseLeave:Connect(function() button.BackgroundColor3 = Settings.Theme.Button end)
+        button.MouseLeave:Connect(function()
+            if button == codexProviderButton and provider == "Codex" then
+                button.BackgroundColor3 = Settings.Theme.ListSelection
+            elseif button == freebuffProviderButton and provider == "Freebuff" then
+                button.BackgroundColor3 = Settings.Theme.ListSelection
+            else
+                button.BackgroundColor3 = Settings.Theme.Button
+            end
+        end)
         return button
     end
 
     Codex.Init = function()
         window = Lib.Window.new()
-        window:SetTitle("Codex")
+        window:SetTitle("AI Assistant")
         window:Resize(640, 520)
         Codex.Window = window
 
@@ -14991,14 +15125,17 @@ local function main()
         top.BackgroundColor3 = Settings.Theme.Main2
         top.BorderSizePixel = 0
         top.Position = UDim2.new(0, 6, 0, 7)
-        top.Size = UDim2.new(1, -12, 0, 28)
+        top.Size = UDim2.new(1, -12, 0, 56)
         top.Parent = content
         local topCorner = Instance.new("UICorner", top)
         topCorner.CornerRadius = UDim.new(0, 4)
 
-        syncButton = makeButton(top, "Sync Dex", 4, 76)
-        deepSyncButton = makeButton(top, "Deep Sync", 84, 84)
-        newThreadButton = makeButton(top, "New Chat", 172, 74)
+        codexProviderButton = makeButton(top, "Codex", 4, 70, 3, 22)
+        freebuffProviderButton = makeButton(top, "Freebuff", 78, 78, 3, 22)
+
+        syncButton = makeButton(top, "Sync Dex", 4, 76, 30, 22)
+        deepSyncButton = makeButton(top, "Deep Sync", 84, 84, 30, 22)
+        newThreadButton = makeButton(top, "New Chat", 172, 92, 30, 22)
 
         statusLabel = Instance.new("TextLabel")
         statusLabel.BackgroundTransparency = 1
@@ -15007,8 +15144,8 @@ local function main()
         statusLabel.TextXAlignment = Enum.TextXAlignment.Right
         statusLabel.TextColor3 = Settings.Theme.Text
         statusLabel.Text = "Checking bridge..."
-        statusLabel.Position = UDim2.new(0, 252, 0, 0)
-        statusLabel.Size = UDim2.new(1, -258, 1, 0)
+        statusLabel.Position = UDim2.new(0, 164, 0, 3)
+        statusLabel.Size = UDim2.new(1, -170, 0, 22)
         statusLabel.Parent = top
 
         contextLabel = Instance.new("TextLabel")
@@ -15018,7 +15155,7 @@ local function main()
         contextLabel.TextXAlignment = Enum.TextXAlignment.Left
         contextLabel.TextColor3 = Settings.Theme.PlaceholderText
         contextLabel.Text = "Sync Dex = ALL Explorer to trusted folder | Deep Sync = + properties + accessible script sources"
-        contextLabel.Position = UDim2.new(0, 8, 0, 39)
+        contextLabel.Position = UDim2.new(0, 8, 0, 67)
         contextLabel.Size = UDim2.new(1, -16, 0, 18)
         contextLabel.Parent = content
 
@@ -15029,8 +15166,8 @@ local function main()
         messages.ScrollBarImageColor3 = Settings.Theme.Highlight
         messages.AutomaticCanvasSize = Enum.AutomaticSize.Y
         messages.CanvasSize = UDim2.new(0, 0, 0, 0)
-        messages.Position = UDim2.new(0, 6, 0, 60)
-        messages.Size = UDim2.new(1, -12, 1, -112)
+        messages.Position = UDim2.new(0, 6, 0, 88)
+        messages.Size = UDim2.new(1, -12, 1, -140)
         messages.Parent = content
         local msgCorner = Instance.new("UICorner", messages)
         msgCorner.CornerRadius = UDim.new(0, 4)
@@ -15083,6 +15220,18 @@ local function main()
         local sendCorner = Instance.new("UICorner", sendButton)
         sendCorner.CornerRadius = UDim.new(0, 4)
 
+        codexProviderButton.MouseButton1Click:Connect(function()
+            if busy then return end
+            Codex.SetProvider("Codex")
+            contextLabel.Text = "Codex: embedded chat + dynamic Dex queries | Sync/Deep Sync mirror the full Explorer"
+        end)
+
+        freebuffProviderButton.MouseButton1Click:Connect(function()
+            if busy then return end
+            Codex.SetProvider("Freebuff")
+            contextLabel.Text = "Freebuff: trusted-folder mode | Sync/Deep Sync mirrors ALL Explorer; Open Freebuff launches it in that folder"
+        end)
+
         local function submit()
             local message = inputBox.Text
             if message == "" then return end
@@ -15121,7 +15270,8 @@ local function main()
             end)
         end
 
-        addMessage("Codex", "Dex++ AI Mirror loaded. Sync Dex mirrors the complete Explorer visible to Dex into the trusted workspace. Deep Sync additionally exports readable properties and script sources available to the current Dex environment.")
+        addMessage("AI", "Dex++ AI Assistant loaded. Choose Codex for embedded chat, or Freebuff for trusted-folder mode. Both providers use the same Full Explorer mirror. Deep Sync additionally exports readable properties and script sources available to the current Dex environment.")
+        updateProviderVisuals()
         task.spawn(Codex.Health)
     end
 
@@ -15250,6 +15400,7 @@ DefaultSettings = (function()
 		},
 		Codex = {
 			_Recurse = true,
+			Provider = "Codex",
 			BridgeUrl = "http://127.0.0.1:32187",
 			MaxInstances = 12000,
 			MaxScripts = 250,
@@ -16632,7 +16783,7 @@ Main = (function()
 		
 		Main.CreateApp({Name = "Console", IconMap = Main.LargeIcons, Icon = "Executor", Window = Console.Window})
 
-		Main.CreateApp({Name = "Codex", IconMap = Main.LargeIcons, Icon = "Script_Viewer", Window = Codex.Window})
+		Main.CreateApp({Name = "AI Assistant", IconMap = Main.LargeIcons, Icon = "Script_Viewer", Window = Codex.Window})
 		
 		Main.CreateApp({Name = "Save Instance", IconMap = Main.LargeIcons, Icon = "Book", Window = SaveInstance.Window})
 		
