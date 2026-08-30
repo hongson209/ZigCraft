@@ -14144,7 +14144,7 @@ local function main()
     local submitSerial = 0
     local composerHeight = 40
 
-    Codex.Version = "1.6.0"
+    Codex.Version = "1.6.2"
     Codex.Window = nil
     Codex.LastSnapshotStats = nil
 
@@ -14273,6 +14273,15 @@ local function main()
             end
         end
         return table.concat(out)
+    end
+
+    -- Keep user prompts exactly as typed (including internal and trailing new lines).
+    -- Only normalize CRLF/CR to LF and reject an all-whitespace prompt.
+    local function normalizePrompt(value)
+        value = sanitizeUtf8String(tostring(value or ""))
+        value = value:gsub("\r\n", "\n"):gsub("\r", "\n")
+        if not value:find("%S") then return "" end
+        return value
     end
 
     -- Return a UTF-8-safe byte chunk. Offsets are zero-based so the bridge/model can
@@ -15202,8 +15211,10 @@ local function main()
 
     local function splitDisplayText(text, chunkSize)
         local out = {}
-        chunkSize = chunkSize or 3500
+        text = sanitizeUtf8String(text)
+        chunkSize = math.max(512, tonumber(chunkSize) or 3500)
         if text == "" then return {""} end
+
         local cursor = 1
         while cursor <= #text do
             local stop = math.min(#text, cursor + chunkSize - 1)
@@ -15213,7 +15224,18 @@ local function main()
                 if newline and newline > math.floor(chunkSize * 0.55) then
                     stop = cursor + newline - 2
                 end
+
+                -- Never split a UTF-8 codepoint between two TextLabels.
+                if utf8 and utf8.len then
+                    while stop > cursor do
+                        local okUtf8, lenUtf8 = pcall(utf8.len, text:sub(cursor, stop))
+                        if okUtf8 and lenUtf8 ~= nil then break end
+                        stop -= 1
+                    end
+                end
             end
+
+            if stop < cursor then stop = math.min(#text, cursor + chunkSize - 1) end
             out[#out + 1] = text:sub(cursor, stop)
             cursor = stop + 1
         end
@@ -15228,9 +15250,83 @@ local function main()
         end)
     end
 
+    local function extractCodeBlocks(text)
+        local blocks = {}
+        if type(text) ~= "string" or text == "" then return blocks end
+
+        -- Markdown fenced code blocks. Language tag is intentionally ignored.
+        for body in text:gmatch("```[^\n]*\n(.-)```") do
+            if body and body ~= "" then
+                blocks[#blocks + 1] = body:gsub("\n$", "")
+            end
+        end
+        return blocks
+    end
+
+    local function copyText(text, button, successLabel)
+        if not env.setclipboard then
+            setStatus("Clipboard is not supported by this executor", false)
+            return false
+        end
+
+        local ok, err = pcall(env.setclipboard, tostring(text or ""))
+        if not ok then
+            setStatus("Copy failed: " .. sanitizeString(err, 180), false)
+            return false
+        end
+
+        setStatus(successLabel or "Copied to clipboard", true)
+        if button and button.Parent then
+            local oldText = button.Text
+            button.Text = "Copied!"
+            task.delay(0.9, function()
+                if button and button.Parent then
+                    button.Text = oldText
+                end
+            end)
+        end
+        return true
+    end
+
+    local function makeMessageActionButton(parent, text, order)
+        local button = Instance.new("TextButton")
+        button.AutoButtonColor = false
+        button.BackgroundColor3 = Settings.Theme.Button
+        button.BorderSizePixel = 0
+        button.Font = Enum.Font.SourceSans
+        button.TextSize = 11
+        button.TextColor3 = Settings.Theme.Text
+        button.Text = text
+        button.AutomaticSize = Enum.AutomaticSize.X
+        button.Size = UDim2.new(0, 52, 0, 18)
+        button.LayoutOrder = order or 1
+        button.Parent = parent
+
+        local padding = Instance.new("UIPadding")
+        padding.PaddingLeft = UDim.new(0, 7)
+        padding.PaddingRight = UDim.new(0, 7)
+        padding.Parent = button
+
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 4)
+        corner.Parent = button
+
+        button.MouseEnter:Connect(function()
+            if button.Parent then button.BackgroundColor3 = Settings.Theme.ButtonHover end
+        end)
+        button.MouseLeave:Connect(function()
+            if button.Parent then button.BackgroundColor3 = Settings.Theme.Button end
+        end)
+        return button
+    end
+
     local function addMessage(role, text)
         if not messages then return end
-        text = sanitizeString(text, tonumber(cfg("MaxChatDisplayLength", 60000)) or 60000)
+        text = sanitizeUtf8String(text)
+        local displayLimit = tonumber(cfg("MaxChatDisplayLength", 0)) or 0
+        if displayLimit > 0 and #text > displayLimit then
+            text = text:sub(1, displayLimit) .. "\n...[display truncated " .. tostring(#text - displayLimit) .. " chars]"
+        end
 
         local holder = Instance.new("Frame")
         holder.BackgroundTransparency = 1
@@ -15244,17 +15340,52 @@ local function main()
         layout.Padding = UDim.new(0, 2)
         layout.Parent = holder
 
+        -- Message header: role on the left, copy actions on the right.
+        local header = Instance.new("Frame")
+        header.BackgroundTransparency = 1
+        header.Size = UDim2.new(1, 0, 0, 20)
+        header.LayoutOrder = 1
+        header.Parent = holder
+
         local roleLabel = Instance.new("TextLabel")
         roleLabel.BackgroundTransparency = 1
         roleLabel.Font = Enum.Font.SourceSansBold
         roleLabel.TextSize = 13
         roleLabel.TextXAlignment = Enum.TextXAlignment.Left
-        roleLabel.TextYAlignment = Enum.TextYAlignment.Top
+        roleLabel.TextYAlignment = Enum.TextYAlignment.Center
         roleLabel.TextColor3 = role == "You" and Color3.fromRGB(125, 190, 255) or Color3.fromRGB(130, 225, 160)
         roleLabel.Text = role
-        roleLabel.Size = UDim2.new(1, 0, 0, 18)
-        roleLabel.LayoutOrder = 1
-        roleLabel.Parent = holder
+        roleLabel.Size = UDim2.new(1, -150, 1, 0)
+        roleLabel.Position = UDim2.new(0, 0, 0, 0)
+        roleLabel.Parent = header
+
+        local actions = Instance.new("Frame")
+        actions.BackgroundTransparency = 1
+        actions.AnchorPoint = Vector2.new(1, 0)
+        actions.Position = UDim2.new(1, 0, 0, 0)
+        actions.Size = UDim2.new(0, 146, 0, 18)
+        actions.Parent = header
+
+        local actionLayout = Instance.new("UIListLayout")
+        actionLayout.FillDirection = Enum.FillDirection.Horizontal
+        actionLayout.HorizontalAlignment = Enum.HorizontalAlignment.Right
+        actionLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+        actionLayout.Padding = UDim.new(0, 5)
+        actionLayout.SortOrder = Enum.SortOrder.LayoutOrder
+        actionLayout.Parent = actions
+
+        local codeBlocks = extractCodeBlocks(text)
+        if #codeBlocks > 0 then
+            local copyCode = makeMessageActionButton(actions, "Copy Code", 1)
+            copyCode.MouseButton1Click:Connect(function()
+                copyText(table.concat(codeBlocks, "\n\n"), copyCode, #codeBlocks > 1 and ("Copied " .. #codeBlocks .. " code blocks") or "Copied code")
+            end)
+        end
+
+        local copyAll = makeMessageActionButton(actions, "Copy", 2)
+        copyAll.MouseButton1Click:Connect(function()
+            copyText(text, copyAll, role == "You" and "Copied message" or "Copied answer")
+        end)
 
         local chunks = splitDisplayText(text, tonumber(cfg("ChatRenderChunkChars", 3500)) or 3500)
         for i = 1, #chunks do
@@ -15337,9 +15468,9 @@ local function main()
         end
         if inputBox then
             if provider == "Freebuff" then
-                inputBox.PlaceholderText = "Stage a request for Freebuff about @selection or the full Dex mirror..."
+                inputBox.PlaceholderText = "Yêu cầu Freebuff...  Enter xuống dòng • Ctrl+Enter Stage"
             else
-                inputBox.PlaceholderText = "Ask Codex about @selection or the live Dex Explorer..."
+                inputBox.PlaceholderText = "Hỏi Codex...  Enter xuống dòng • Ctrl+Enter gửi"
             end
         end
         if sendButton then
@@ -15371,7 +15502,7 @@ local function main()
     end
 
     function Codex.StageFreebuffPrompt(message)
-        message = tostring(message or ""):match("^%s*(.-)%s*$") or ""
+        message = normalizePrompt(message)
         if message == "" then return end
         if busy then
             addMessage("Freebuff", "A sync/request is already running.")
@@ -15447,7 +15578,7 @@ local function main()
     end
 
     function Codex.Ask(message)
-        message = tostring(message or ""):match("^%s*(.-)%s*$") or ""
+        message = normalizePrompt(message)
         if message == "" then return end
         if provider == "Freebuff" then
             return Codex.StageFreebuffPrompt(message)
@@ -15762,7 +15893,7 @@ local function main()
         inputBox.TextSize = 13
         inputBox.TextColor3 = Settings.Theme.Text
         inputBox.PlaceholderColor3 = Settings.Theme.PlaceholderText
-        inputBox.PlaceholderText = "Ask Codex about @selection or the synced Dex tree..."
+        inputBox.PlaceholderText = "Nhập yêu cầu...  Enter xuống dòng • Ctrl+Enter gửi"
         inputBox.TextXAlignment = Enum.TextXAlignment.Left
         inputBox.TextYAlignment = Enum.TextYAlignment.Top
         inputBox.TextWrapped = true
@@ -15779,8 +15910,9 @@ local function main()
         sendButton.TextSize = 13
         sendButton.TextColor3 = Color3.new(1, 1, 1)
         sendButton.Text = "Send"
-        sendButton.Position = UDim2.new(1, -66, 0, 5)
-        sendButton.Size = UDim2.new(0, 60, 1, -10)
+        sendButton.AnchorPoint = Vector2.new(1, 1)
+        sendButton.Position = UDim2.new(1, -6, 1, -6)
+        sendButton.Size = UDim2.new(0, 60, 0, 30)
         sendButton.Parent = inputFrame
         local sendCorner = Instance.new("UICorner", sendButton)
         sendCorner.CornerRadius = UDim.new(0, 4)
@@ -15788,10 +15920,21 @@ local function main()
         local function updateComposerSize()
             if not inputBox or not inputFrame or not messages then return end
             local width = math.max(120, inputBox.AbsoluteSize.X)
-            local sample = inputBox.Text ~= "" and inputBox.Text or " "
-            local okBounds, bounds = pcall(service.TextService.GetTextSize, service.TextService, sample .. "\n", inputBox.TextSize, inputBox.Font, Vector2.new(width, 10000))
-            local needed = okBounds and math.ceil(bounds.Y + 18) or 40
-            composerHeight = math.clamp(needed, 40, tonumber(cfg("ComposerMaxHeight", 118)) or 118)
+            local maxComposerHeight = tonumber(cfg("ComposerMaxHeight", 220)) or 220
+            local text = inputBox.Text ~= "" and inputBox.Text or " "
+            local needed = 40
+
+            -- GetTextSize over a pasted 100k+ prompt on every keystroke is expensive.
+            -- Once the draft is clearly large, the composer is already at max height;
+            -- keep the entire TextBox content but skip measuring the entire string.
+            if #text > (tonumber(cfg("ComposerMeasureCharLimit", 12000)) or 12000) then
+                needed = maxComposerHeight
+            else
+                local okBounds, bounds = pcall(service.TextService.GetTextSize, service.TextService, text .. "\n", inputBox.TextSize, inputBox.Font, Vector2.new(width, 10000))
+                needed = okBounds and math.ceil(bounds.Y + 18) or 40
+            end
+
+            composerHeight = math.clamp(needed, 40, maxComposerHeight)
             inputFrame.Position = UDim2.new(0, 6, 1, -(composerHeight + 6))
             inputFrame.Size = UDim2.new(1, -12, 0, composerHeight)
             messages.Size = UDim2.new(1, -12, 1, -(100 + composerHeight))
@@ -15814,8 +15957,7 @@ local function main()
         end)
 
         local function submit(explicitText)
-            local message = explicitText or inputBox.Text
-            message = tostring(message or ""):gsub("[\r\n]+$", ""):match("^%s*(.-)%s*$") or ""
+            local message = normalizePrompt(explicitText ~= nil and explicitText or inputBox.Text)
             if message == "" then return end
             if busy then return end
 
@@ -15832,25 +15974,28 @@ local function main()
 
         sendButton.MouseButton1Click:Connect(function() submit() end)
 
-        -- MultiLine TextBox does not reliably fire FocusLost on Enter. Handle the
-        -- keyboard directly: Enter sends, Shift+Enter inserts a new line.
+        -- Editor-style composer:
+        --   Enter       -> normal newline (handled natively by the MultiLine TextBox)
+        --   Ctrl+Enter  -> send/stage without destroying multiline formatting
         service.UserInputService.InputBegan:Connect(function(input, processed)
             if not inputBox or not inputBox:IsFocused() then return end
             if input.KeyCode ~= Enum.KeyCode.Return then return end
-            local shift = service.UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) or service.UserInputService:IsKeyDown(Enum.KeyCode.RightShift)
-            if shift then return end
+
+            local ctrl = service.UserInputService:IsKeyDown(Enum.KeyCode.LeftControl)
+                or service.UserInputService:IsKeyDown(Enum.KeyCode.RightControl)
+            if not ctrl then
+                -- Do not consume Return: Roblox inserts the newline into the TextBox.
+                return
+            end
 
             local message = inputBox.Text
             inputBox:ReleaseFocus()
             task.defer(function() submit(message) end)
         end)
 
-        -- Fallback for executors/clients that still release focus on Return.
-        inputBox.FocusLost:Connect(function(enterPressed)
-            if enterPressed then
-                local shift = service.UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) or service.UserInputService:IsKeyDown(Enum.KeyCode.RightShift)
-                if not shift and inputBox.Text ~= "" then submit() end
-            end
+        -- Losing focus must never implicitly submit a long/multiline draft.
+        inputBox.FocusLost:Connect(function()
+            task.defer(updateComposerSize)
         end)
 
         syncButton.MouseButton1Click:Connect(function()
@@ -15880,7 +16025,7 @@ local function main()
             end)
         end
 
-        addMessage("AI", "Dex++ AI Assistant v1.6 ready. Lazy Read is ON: Codex does not scan/decompile the full Explorer before every message. It requests only the objects, properties and scripts needed for your current request. Use Sync/Deep Sync only when you explicitly want a disk mirror or Freebuff workspace.")
+        addMessage("AI", "Dex++ AI Assistant v1.6.2 ready. Lazy Read is ON: Codex does not scan/decompile the full Explorer before every message. It requests only the objects, properties and scripts needed for your current request. Use Sync/Deep Sync only when you explicitly want a disk mirror or Freebuff workspace. Enter creates a new line; Ctrl+Enter sends.")
         updateProviderVisuals()
         task.spawn(Codex.Health)
         -- Keep status live. This fixes the confusing case where Freebuff is launched
@@ -16034,10 +16179,11 @@ DefaultSettings = (function()
 			MaxChildrenInDetail = 300,
 			MaxSourceLength = 60000,
 			MaxStringLength = 32768,
-			MaxChatMessageLength = 120000,
-			MaxChatDisplayLength = 60000,
+			MaxChatMessageLength = 4194304, -- UI/bridge can carry very large multiline prompts
+			MaxChatDisplayLength = 0, -- 0 = no artificial display truncation; renderer chunks long messages
 			ChatRenderChunkChars = 3500,
-			ComposerMaxHeight = 118,
+			ComposerMaxHeight = 220,
+			ComposerMeasureCharLimit = 12000, -- avoid measuring huge pasted prompts every keystroke
 			FullSnapshotTTL = 300,
 			MaxToolHops = 14,
 			MaxToolBatch = 8,
