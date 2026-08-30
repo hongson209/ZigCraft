@@ -4,7 +4,7 @@
 	
 	Developed by Chillz
 	
-	cac
+	Dex++ is a revival of Moon's Dex, made to fulfill Moon's Dex prophecy.
 ]]
 
 local selection
@@ -14126,15 +14126,17 @@ local function main()
     local window
     local statusLabel, contextLabel, messages, inputBox, sendButton
     local syncButton, deepSyncButton, newThreadButton
-    local codexProviderButton, freebuffProviderButton
+    local codexProviderButton, freebuffProviderButton, freebuffCheckButton
     local busy = false
+    local lastFreebuffResponseId = nil
     local provider = tostring((Settings.Codex and Settings.Codex.Provider) or "Codex")
     if provider ~= "Freebuff" then provider = "Codex" end
     local pathIndex = setmetatable({}, {__mode = "v"})
     local hasFullSnapshot = false
     local lastFullSync = 0
+    local lastDeepSync = 0
 
-    Codex.Version = "1.2.0"
+    Codex.Version = "1.5.0"
     Codex.Window = nil
     Codex.LastSnapshotStats = nil
 
@@ -14181,7 +14183,7 @@ local function main()
         if body ~= nil then
             local okEncode, encoded = pcall(HttpService.JSONEncode, HttpService, body)
             if not okEncode then
-                return false, "JSON encode failed: " .. tostring(encoded)
+                return false, "JSON encode failed for " .. tostring(path) .. ": " .. tostring(encoded)
             end
             req.Body = encoded
         end
@@ -14211,9 +14213,89 @@ local function main()
     local function sanitizeString(value, maxLen)
         value = tostring(value or "")
         maxLen = maxLen or 4096
+
+        -- HttpService:JSONEncode rejects malformed UTF-8. Decompiled source or
+        -- unusual executor-returned strings can contain arbitrary bytes, so keep
+        -- valid UTF-8 untouched and fall back to a conservative ASCII-safe copy.
+        local validUtf8 = false
+        if utf8 and utf8.len then
+            local okUtf8, lenUtf8 = pcall(utf8.len, value)
+            validUtf8 = okUtf8 and lenUtf8 ~= nil
+        else
+            validUtf8 = true
+        end
+        if not validUtf8 then
+            local out = table.create(math.min(#value, maxLen))
+            local lim = math.min(#value, maxLen)
+            for i = 1, lim do
+                local b = string.byte(value, i)
+                if b == 9 or b == 10 or b == 13 or (b >= 32 and b <= 126) then
+                    out[#out + 1] = string.char(b)
+                else
+                    out[#out + 1] = "?"
+                end
+            end
+            value = table.concat(out)
+        end
+
         if #value > maxLen then
             return value:sub(1, maxLen) .. "\n...[truncated " .. tostring(#value - maxLen) .. " chars]"
         end
+        return value
+    end
+
+    local function sanitizeUtf8String(value)
+        value = tostring(value or "")
+        local validUtf8 = false
+        if utf8 and utf8.len then
+            local okUtf8, lenUtf8 = pcall(utf8.len, value)
+            validUtf8 = okUtf8 and lenUtf8 ~= nil
+        else
+            validUtf8 = true
+        end
+        if validUtf8 then return value end
+
+        local out = table.create(#value)
+        for i = 1, #value do
+            local b = string.byte(value, i)
+            if b == 9 or b == 10 or b == 13 or (b >= 32 and b <= 126) then
+                out[#out + 1] = string.char(b)
+            else
+                out[#out + 1] = "?"
+            end
+        end
+        return table.concat(out)
+    end
+
+    -- Return a UTF-8-safe byte chunk. Offsets are zero-based so the bridge/model can
+    -- paginate large script sources without silently truncating them.
+    local function byteChunk(value, offset, maxBytes)
+        value = tostring(value or "")
+        offset = math.max(0, math.floor(tonumber(offset) or 0))
+        maxBytes = math.clamp(math.floor(tonumber(maxBytes) or 48000), 1024, 262144)
+        if offset >= #value then
+            return "", offset, false, #value
+        end
+
+        local startByte = offset + 1
+        local endByte = math.min(#value, startByte + maxBytes - 1)
+        if utf8 and utf8.len and endByte < #value then
+            while endByte >= startByte do
+                local okUtf8, lenUtf8 = pcall(utf8.len, value:sub(startByte, endByte))
+                if okUtf8 and lenUtf8 ~= nil then break end
+                endByte -= 1
+            end
+        end
+        if endByte < startByte then endByte = math.min(#value, startByte + maxBytes - 1) end
+        local chunk = value:sub(startByte, endByte)
+        local nextOffset = endByte
+        return chunk, nextOffset, nextOffset < #value, #value
+    end
+
+    local function safeNumber(value)
+        if value ~= value then return "<NaN>" end
+        if value == math.huge then return "<Infinity>" end
+        if value == -math.huge then return "<-Infinity>" end
         return value
     end
 
@@ -14222,30 +14304,33 @@ local function main()
         if depth > 4 then return "<max-depth>" end
 
         local valueType = typeof(value)
-        if valueType == "nil" or valueType == "boolean" or valueType == "number" then
+        if valueType == "nil" or valueType == "boolean" then
             return value
+        elseif valueType == "number" then
+            return safeNumber(value)
         elseif valueType == "string" then
             return sanitizeString(value, cfg("MaxStringLength", 4096))
         elseif valueType == "EnumItem" or valueType == "BrickColor" then
             return tostring(value)
         elseif valueType == "Vector2" then
-            return {x = value.X, y = value.Y}
+            return {x = safeNumber(value.X), y = safeNumber(value.Y)}
         elseif valueType == "Vector3" then
-            return {x = value.X, y = value.Y, z = value.Z}
+            return {x = safeNumber(value.X), y = safeNumber(value.Y), z = safeNumber(value.Z)}
         elseif valueType == "Color3" then
-            return {r = value.R, g = value.G, b = value.B, hex = value:ToHex()}
+            return {r = safeNumber(value.R), g = safeNumber(value.G), b = safeNumber(value.B), hex = value:ToHex()}
         elseif valueType == "UDim" then
-            return {scale = value.Scale, offset = value.Offset}
+            return {scale = safeNumber(value.Scale), offset = safeNumber(value.Offset)}
         elseif valueType == "UDim2" then
             return {
-                x = {scale = value.X.Scale, offset = value.X.Offset},
-                y = {scale = value.Y.Scale, offset = value.Y.Offset},
+                x = {scale = safeNumber(value.X.Scale), offset = safeNumber(value.X.Offset)},
+                y = {scale = safeNumber(value.Y.Scale), offset = safeNumber(value.Y.Offset)},
             }
         elseif valueType == "CFrame" then
             local components = {value:GetComponents()}
+            for i = 1, #components do components[i] = safeNumber(components[i]) end
             return {components = components}
         elseif valueType == "NumberRange" then
-            return {min = value.Min, max = value.Max}
+            return {min = safeNumber(value.Min), max = safeNumber(value.Max)}
         elseif valueType == "NumberSequence" or valueType == "ColorSequence" then
             return sanitizeString(tostring(value), 2048)
         elseif valueType == "Rect" or valueType == "Ray" or valueType == "Region3" or valueType == "PhysicalProperties" then
@@ -14317,12 +14402,14 @@ local function main()
         local classData = API and API.Classes and API.Classes[className]
         local count = 0
         local used = {}
-        limit = tonumber(limit) or cfg("MaxPropertiesPerInstance", 160)
+        limit = tonumber(limit)
+        if limit == nil then limit = tonumber(cfg("MaxPropertiesPerInstance", 160)) or 160 end
+        local unlimited = limit <= 0
 
-        while classData and count < limit do
+        while classData and (unlimited or count < limit) do
             local properties = classData.Properties or {}
             for i = 1, #properties do
-                if count >= limit then break end
+                if not unlimited and count >= limit then break end
                 local prop = properties[i]
                 local name = prop.Name
                 if name and not used[name] and name ~= "Source" then
@@ -14340,7 +14427,7 @@ local function main()
         return result
     end
 
-    local function decompileScript(scr)
+    local function decompileScriptRaw(scr)
         if not env.decompile or not env.isViableDecompileScript or not env.isViableDecompileScript(scr) then
             return nil, "source unavailable in current Dex environment"
         end
@@ -14349,9 +14436,19 @@ local function main()
         if not ok or type(source) ~= "string" or source == "" then
             return nil, sanitizeString(source or "decompile failed", 512)
         end
+        return sanitizeUtf8String(source), nil
+    end
 
+    -- Preview form used by selection/detail context. Full source is available through
+    -- get_script pagination and through the Deep Sync disk mirror.
+    local function decompileScript(scr)
+        local source, err = decompileScriptRaw(scr)
+        if not source then return nil, err end
         local maxLen = tonumber(cfg("MaxSourceLength", 60000)) or 60000
-        return sanitizeString(source, maxLen), nil
+        if #source > maxLen then
+            return source:sub(1, maxLen) .. "\n...[preview truncated; use get_script pagination for the full source]", nil
+        end
+        return source, nil
     end
 
     local function basicInstanceRecord(obj)
@@ -14403,6 +14500,32 @@ local function main()
         return record
     end
 
+    local function collectRoots(includeNil)
+        local roots = {game}
+        local ok, descendants = pcall(game.GetDescendants, game)
+        if ok and type(descendants) == "table" then
+            for i = 1, #descendants do roots[#roots + 1] = descendants[i] end
+        end
+        if includeNil and env.getnilinstances then
+            local okNil, nils = pcall(env.getnilinstances)
+            if okNil and type(nils) == "table" then
+                for i = 1, #nils do roots[#roots + 1] = nils[i] end
+            end
+        end
+        return roots
+    end
+
+    local function pageMeta(total, offset, count)
+        local nextOffset = offset + count
+        return {
+            total = total,
+            offset = offset,
+            count = count,
+            nextOffset = nextOffset,
+            hasMore = nextOffset < total,
+        }
+    end
+
     function Codex.ResolvePath(path)
         if typeof(path) == "Instance" then return path end
         path = tostring(path or "")
@@ -14411,17 +14534,7 @@ local function main()
         local cached = pathIndex[path]
         if cached and cached.Parent ~= nil then return cached end
 
-        local roots = {game}
-        local ok, descendants = pcall(game.GetDescendants, game)
-        if ok then
-            for i = 1, #descendants do roots[#roots + 1] = descendants[i] end
-        end
-        if env.getnilinstances then
-            local okNil, nils = pcall(env.getnilinstances)
-            if okNil and type(nils) == "table" then
-                for i = 1, #nils do roots[#roots + 1] = nils[i] end
-            end
-        end
+        local roots = collectRoots(true)
 
         for i = 1, #roots do
             local obj = roots[i]
@@ -14433,6 +14546,15 @@ local function main()
         return nil
     end
 
+    local getTopServiceName
+
+    local function safeIsA(obj, className)
+        if className == "" then return true end
+        if obj.ClassName == className then return true end
+        local ok, result = pcall(obj.IsA, obj, className)
+        return ok and result == true
+    end
+
     local function queryError(message)
         return {ok = false, error = tostring(message)}
     end
@@ -14441,41 +14563,60 @@ local function main()
         if type(query) ~= "table" then return queryError("query must be an object") end
         local op = tostring(query.op or query.operation or "")
         local args = type(query.args) == "table" and query.args or query
-        local maxResults = math.clamp(tonumber(args.limit) or 100, 1, 500)
+        local maxResults = math.clamp(tonumber(args.limit) or 100, 1, tonumber(cfg("MaxToolPageSize", 500)) or 500)
+        local offset = math.max(0, math.floor(tonumber(args.offset) or 0))
 
         if op == "get_selection" then
             return {ok = true, data = Codex.BuildSelectionContext()}
-        end
-
-        if op == "search_instances" then
+        elseif op == "list_services" then
+            local out = {}
+            local children = game:GetChildren()
+            for i = 1, #children do
+                out[#out + 1] = basicInstanceRecord(children[i])
+            end
+            return {ok = true, count = #out, data = out}
+        elseif op == "search_instances" then
             local needle = string.lower(tostring(args.query or args.name or ""))
             local className = tostring(args.className or args.class or "")
-            local results = {}
-            local roots = {game}
-            local ok, descendants = pcall(game.GetDescendants, game)
-            if ok then
-                for i = 1, #descendants do roots[#roots + 1] = descendants[i] end
-            end
-            if args.includeNil and env.getnilinstances then
-                local okNil, nils = pcall(env.getnilinstances)
-                if okNil and type(nils) == "table" then
-                    for i = 1, #nils do roots[#roots + 1] = nils[i] end
-                end
-            end
-
+            local serviceName = string.lower(tostring(args.service or ""))
+            local roots = collectRoots(args.includeNil == true)
+            local matches = {}
             for i = 1, #roots do
                 local obj = roots[i]
                 local path = getPath(obj)
                 pathIndex[path] = obj
                 local nameMatch = needle == "" or string.find(string.lower(obj.Name), needle, 1, true) or string.find(string.lower(path), needle, 1, true)
-                local classMatch = className == "" or obj.ClassName == className or obj:IsA(className)
-                if nameMatch and classMatch then
-                    results[#results + 1] = basicInstanceRecord(obj)
-                    if #results >= maxResults then break end
+                local classMatch = safeIsA(obj, className)
+                local serviceMatch = serviceName == "" or string.lower(getTopServiceName(obj)) == serviceName
+                if nameMatch and classMatch and serviceMatch then matches[#matches + 1] = obj end
+                if i % 300 == 0 then task.wait() end
+            end
+            local out = {}
+            for i = offset + 1, math.min(#matches, offset + maxResults) do out[#out + 1] = basicInstanceRecord(matches[i]) end
+            local meta = pageMeta(#matches, offset, #out)
+            return {ok = true, count = meta.count, total = meta.total, offset = meta.offset, nextOffset = meta.nextOffset, hasMore = meta.hasMore, data = out}
+        elseif op == "get_scripts" then
+            local needle = string.lower(tostring(args.query or ""))
+            local serviceName = string.lower(tostring(args.service or ""))
+            local roots = collectRoots(args.includeNil == true)
+            local matches = {}
+            for i = 1, #roots do
+                local obj = roots[i]
+                if obj:IsA("LocalScript") or obj:IsA("ModuleScript") or obj:IsA("Script") then
+                    local path = getPath(obj)
+                    local qMatch = needle == "" or string.find(string.lower(obj.Name), needle, 1, true) or string.find(string.lower(path), needle, 1, true)
+                    local serviceMatch = serviceName == "" or string.lower(getTopServiceName(obj)) == serviceName
+                    if qMatch and serviceMatch then matches[#matches + 1] = obj end
                 end
                 if i % 300 == 0 then task.wait() end
             end
-            return {ok = true, count = #results, data = results}
+            local out = {}
+            for i = offset + 1, math.min(#matches, offset + maxResults) do
+                local obj = matches[i]
+                out[#out + 1] = {path = getPath(obj), name = obj.Name, className = obj.ClassName, service = getTopServiceName(obj)}
+            end
+            local meta = pageMeta(#matches, offset, #out)
+            return {ok = true, count = meta.count, total = meta.total, offset = meta.offset, nextOffset = meta.nextOffset, hasMore = meta.hasMore, data = out}
         end
 
         local path = args.path or query.path
@@ -14486,36 +14627,93 @@ local function main()
             return {ok = true, data = detailedInstanceRecord(obj, args.includeSource == true)}
         elseif op == "get_properties" then
             return {ok = true, path = getPath(obj), data = getReadableProperties(obj, args.limit or cfg("MaxPropertiesPerInstance", 160))}
+        elseif op == "get_property" then
+            local prop = tostring(args.property or args.name or "")
+            if prop == "" then return queryError("property is required") end
+            if prop == "Source" then return queryError("use get_script for script source") end
+            local okProp, value = pcall(function() return obj[prop] end)
+            if not okProp then return queryError(value) end
+            if typeof(value) == "string" then
+                local raw = sanitizeUtf8String(value)
+                local piece, nextOffset, hasMore, totalBytes = byteChunk(raw, offset, tonumber(args.chunkBytes) or cfg("ToolSourceChunkBytes", 48000))
+                return {ok = true, path = getPath(obj), property = prop, valueType = "string", data = piece, offset = offset, nextOffset = nextOffset, hasMore = hasMore, totalBytes = totalBytes}
+            end
+            return {ok = true, path = getPath(obj), property = prop, data = serializeValue(value)}
         elseif op == "get_attributes" then
             return {ok = true, path = getPath(obj), data = getAttributes(obj)}
+        elseif op == "get_attribute" then
+            local attributeName = tostring(args.attribute or args.name or "")
+            if attributeName == "" then return queryError("attribute is required") end
+            local okAttr, value = pcall(obj.GetAttribute, obj, attributeName)
+            if not okAttr then return queryError(value) end
+            if typeof(value) == "string" then
+                local raw = sanitizeUtf8String(value)
+                local piece, nextOffset, hasMore, totalBytes = byteChunk(raw, offset, tonumber(args.chunkBytes) or cfg("ToolSourceChunkBytes", 48000))
+                return {ok = true, path = getPath(obj), attribute = attributeName, valueType = "string", data = piece, offset = offset, nextOffset = nextOffset, hasMore = hasMore, totalBytes = totalBytes}
+            end
+            return {ok = true, path = getPath(obj), attribute = attributeName, data = serializeValue(value)}
         elseif op == "get_children" then
-            local out = {}
             local okChildren, children = pcall(obj.GetChildren, obj)
             if not okChildren then return queryError(children) end
-            for i = 1, math.min(#children, maxResults) do
-                out[#out + 1] = basicInstanceRecord(children[i])
-            end
-            return {ok = true, path = getPath(obj), count = #out, total = #children, data = out}
-        elseif op == "get_descendants" then
             local out = {}
+            for i = offset + 1, math.min(#children, offset + maxResults) do out[#out + 1] = basicInstanceRecord(children[i]) end
+            local meta = pageMeta(#children, offset, #out)
+            return {ok = true, path = getPath(obj), count = meta.count, total = meta.total, offset = meta.offset, nextOffset = meta.nextOffset, hasMore = meta.hasMore, data = out}
+        elseif op == "get_descendants" then
             local okDesc, descendants = pcall(obj.GetDescendants, obj)
             if not okDesc then return queryError(descendants) end
-            for i = 1, math.min(#descendants, maxResults) do
+            local out = {}
+            for i = offset + 1, math.min(#descendants, offset + maxResults) do
                 out[#out + 1] = basicInstanceRecord(descendants[i])
                 if i % 150 == 0 then task.wait() end
             end
-            return {ok = true, path = getPath(obj), count = #out, total = #descendants, data = out}
-        elseif op == "get_script" then
-            if not (obj:IsA("LocalScript") or obj:IsA("ModuleScript") or obj:IsA("Script")) then
-                return queryError("target is not a script")
+            local meta = pageMeta(#descendants, offset, #out)
+            return {ok = true, path = getPath(obj), count = meta.count, total = meta.total, offset = meta.offset, nextOffset = meta.nextOffset, hasMore = meta.hasMore, data = out}
+        elseif op == "get_ancestors" then
+            local chain = {}
+            local current = obj.Parent
+            while current do
+                chain[#chain + 1] = basicInstanceRecord(current)
+                if current == game then break end
+                current = current.Parent
             end
-            local source, err = decompileScript(obj)
-            return {ok = source ~= nil, path = getPath(obj), className = obj.ClassName, source = source, error = err}
+            return {ok = true, path = getPath(obj), count = #chain, data = chain}
+        elseif op == "get_script" then
+            if not (obj:IsA("LocalScript") or obj:IsA("ModuleScript") or obj:IsA("Script")) then return queryError("target is not a script") end
+            local source, err = decompileScriptRaw(obj)
+            if not source then return {ok = false, path = getPath(obj), className = obj.ClassName, error = err} end
+            local chunk, nextOffset, hasMore, totalBytes = byteChunk(source, offset, tonumber(args.chunkBytes) or cfg("ToolSourceChunkBytes", 48000))
+            return {
+                ok = true, path = getPath(obj), className = obj.ClassName,
+                source = chunk, offset = offset, nextOffset = nextOffset, hasMore = hasMore, totalBytes = totalBytes,
+            }
         elseif op == "get_tags" then
             return {ok = true, path = getPath(obj), data = getTags(obj)}
+        elseif op == "select_instance" or op == "view_instance" then
+            local node = nodes and nodes[obj]
+            if not node or not Explorer or not Explorer.Selection then return queryError("instance is not present in the current Explorer tree") end
+            Explorer.Selection:Set(node)
+            Explorer.ViewNode(node)
+            return {ok = true, action = "selected", path = getPath(obj)}
+        elseif op == "open_script" then
+            if not (obj:IsA("LocalScript") or obj:IsA("ModuleScript") or obj:IsA("Script")) then return queryError("target is not a script") end
+            if not ScriptViewer or not ScriptViewer.ViewScript then return queryError("ScriptViewer unavailable") end
+            ScriptViewer.ViewScript(obj)
+            return {ok = true, action = "script_opened", path = getPath(obj)}
         end
 
-        return queryError("unsupported read operation: " .. op)
+        return queryError("unsupported Dex operation: " .. op)
+    end
+
+    function Codex.ExecuteQueries(queries)
+        if type(queries) ~= "table" then return {queryError("queries must be an array")} end
+        local out = {}
+        local maxBatch = math.clamp(tonumber(cfg("MaxToolBatch", 8)) or 8, 1, 16)
+        for i = 1, math.min(#queries, maxBatch) do
+            out[i] = Codex.ExecuteQuery(queries[i])
+            if i % 2 == 0 then task.wait() end
+        end
+        return out
     end
 
     function Codex.BuildSelectionContext()
@@ -14541,7 +14739,7 @@ local function main()
         }
     end
 
-    local function getTopServiceName(obj)
+    getTopServiceName = function(obj)
         if obj == game then return "DataModel" end
         local current = obj
         local last = obj
@@ -14554,18 +14752,53 @@ local function main()
         return (last and last.Name) or "Unknown"
     end
 
-    local function mirrorRecord(obj, includeProperties, includeSource)
+    local function mirrorRecord(obj, includeProperties)
         local record = basicInstanceRecord(obj)
         record.service = getTopServiceName(obj)
         if includeProperties then
             record.properties = getReadableProperties(obj, cfg("MirrorPropertiesPerInstance", cfg("MaxPropertiesPerInstance", 160)))
         end
-        if includeSource and (obj:IsA("LocalScript") or obj:IsA("ModuleScript") or obj:IsA("Script")) then
-            local source, err = decompileScript(obj)
-            record.source = source
-            record.sourceError = err
-        end
         return record
+    end
+
+    local function uploadMirrorSource(sessionId, obj, source)
+        local beginOk, beginResult = requestBridge("/mirror/source/begin", "POST", {
+            sessionId = sessionId,
+            path = getPath(obj),
+            name = sanitizeString(obj.Name, 512),
+            className = obj.ClassName,
+            totalBytes = #source,
+        })
+        if not beginOk then return false, beginResult end
+        local sourceId = type(beginResult) == "table" and beginResult.sourceId or nil
+        if not sourceId then return false, "bridge did not return source upload id" end
+
+        local sourceOffset = 0
+        local sequence = 0
+        local chunkBytes = tonumber(cfg("MirrorSourceChunkBytes", 48000)) or 48000
+        while sourceOffset < #source do
+            local piece, nextOffset, hasMore = byteChunk(source, sourceOffset, chunkBytes)
+            sequence += 1
+            local chunkOk, chunkResult = requestBridge("/mirror/source/chunk", "POST", {
+                sessionId = sessionId,
+                sourceId = sourceId,
+                sequence = sequence,
+                chunk = piece,
+            })
+            if not chunkOk then
+                requestBridge("/mirror/source/abort", "POST", {sessionId = sessionId, sourceId = sourceId})
+                return false, chunkResult
+            end
+            sourceOffset = nextOffset
+            if not hasMore then break end
+            task.wait()
+        end
+
+        return requestBridge("/mirror/source/end", "POST", {
+            sessionId = sessionId,
+            sourceId = sourceId,
+            totalBytes = #source,
+        })
     end
 
     -- Creates a disk-backed mirror of every Instance currently visible to Dex.
@@ -14575,26 +14808,16 @@ local function main()
         if not env.request then return false, "Executor does not expose an HTTP request function." end
 
         local started = os.clock()
-        local chunkSize = math.clamp(tonumber(cfg("MirrorChunkSize", 100)) or 100, 10, 500)
+        local chunkSize = math.clamp(tonumber(cfg("MirrorChunkSize", 40)) or 40, 5, 250)
         local includeNil = cfg("MirrorIncludeNilInstances", false) == true
-        local roots = {game}
-        local okDesc, descendants = pcall(game.GetDescendants, game)
-        if not okDesc then return false, tostring(descendants) end
-        for i = 1, #descendants do roots[#roots + 1] = descendants[i] end
-
+        local roots = collectRoots(includeNil)
         local nilCount = 0
-        if includeNil and env.getnilinstances then
-            local okNil, nils = pcall(env.getnilinstances)
-            if okNil and type(nils) == "table" then
-                for i = 1, #nils do
-                    roots[#roots + 1] = nils[i]
-                    nilCount += 1
-                end
-            end
+        if includeNil then
+            for i = 1, #roots do if roots[i].Parent == nil and roots[i] ~= game then nilCount += 1 end end
         end
 
         local beginOk, beginResult = requestBridge("/mirror/begin", "POST", {
-            schema = "dexpp.mirror.v1",
+            schema = "dexpp.mirror.v2",
             placeId = game.PlaceId,
             jobId = game.JobId,
             dexVersion = tostring(Main.Version),
@@ -14610,17 +14833,18 @@ local function main()
         if not sessionId then return false, "bridge did not return mirror session id" end
 
         local sent = 0
-        local scripts = 0
+        local scriptObjects = 0
+        local scriptsUploaded = 0
         local unavailableSources = 0
+        local sourceUploadFailures = 0
+        local serializationFallbacks = 0
+        local skippedRecords = 0
         local chunk = {}
 
         local function flush()
             if #chunk == 0 then return true end
-            local ok, result = requestBridge("/mirror/chunk", "POST", {
-                sessionId = sessionId,
-                records = chunk,
-            })
-            if not ok then return false, result end
+            local ok, result = requestBridge("/mirror/chunk", "POST", {sessionId = sessionId, records = chunk})
+            if not ok then return false, "mirror chunk failed after " .. tostring(sent) .. " records: " .. tostring(result) end
             sent += #chunk
             table.clear(chunk)
             return true, result
@@ -14628,13 +14852,62 @@ local function main()
 
         for i = 1, #roots do
             local obj = roots[i]
-            local okRecord, record = pcall(mirrorRecord, obj, includeProperties == true, includeSources == true)
-            if okRecord and record then
-                if includeSources and (obj:IsA("LocalScript") or obj:IsA("ModuleScript") or obj:IsA("Script")) then
-                    scripts += 1
-                    if not record.source then unavailableSources += 1 end
+            local isScript = obj:IsA("LocalScript") or obj:IsA("ModuleScript") or obj:IsA("Script")
+            local source, sourceErr, sourceUploaded = nil, nil, false
+
+            if includeSources and isScript then
+                scriptObjects += 1
+                source, sourceErr = decompileScriptRaw(obj)
+                if source then
+                    setStatus(string.format("Deep Sync source %d | Explorer %d/%d", scriptObjects, i, #roots), nil)
+                    local uploadOk, uploadResult = uploadMirrorSource(sessionId, obj, source)
+                    if uploadOk then
+                        scriptsUploaded += 1
+                        sourceUploaded = true
+                    else
+                        sourceUploadFailures += 1
+                        sourceErr = "source upload failed: " .. tostring(uploadResult)
+                    end
+                else
+                    unavailableSources += 1
                 end
-                chunk[#chunk + 1] = record
+            end
+
+            local okRecord, record = pcall(mirrorRecord, obj, includeProperties == true)
+            if okRecord and record then
+                if includeSources and isScript then
+                    record.sourceAvailable = sourceUploaded
+                    record.sourceBytes = source and #source or nil
+                    record.sourceError = sourceUploaded and nil or sourceErr
+                end
+
+                local okJson = pcall(HttpService.JSONEncode, HttpService, record)
+                if not okJson then
+                    serializationFallbacks += 1
+                    local okBasic, fallback = pcall(basicInstanceRecord, obj)
+                    if okBasic and fallback then
+                        fallback.service = getTopServiceName(obj)
+                        fallback.serializationWarning = "Detailed properties were omitted because this Instance could not be JSON encoded."
+                        if includeSources and isScript then
+                            fallback.sourceAvailable = sourceUploaded
+                            fallback.sourceBytes = source and #source or nil
+                            fallback.sourceError = sourceUploaded and nil or sourceErr
+                        end
+                        if pcall(HttpService.JSONEncode, HttpService, fallback) then
+                            record = fallback
+                        else
+                            record = nil
+                            skippedRecords += 1
+                        end
+                    else
+                        record = nil
+                        skippedRecords += 1
+                    end
+                end
+
+                if record then chunk[#chunk + 1] = record end
+            else
+                skippedRecords += 1
             end
 
             if #chunk >= chunkSize then
@@ -14645,7 +14918,7 @@ local function main()
                     return false, flushResult
                 end
                 task.wait()
-            elseif i % 50 == 0 then
+            elseif i % 40 == 0 then
                 task.wait()
             end
         end
@@ -14659,13 +14932,16 @@ local function main()
         local endOk, endResult = requestBridge("/mirror/end", "POST", {
             sessionId = sessionId,
             sentInstances = sent,
-            scriptCount = scripts,
+            scriptObjects = scriptObjects,
+            scriptCount = scriptsUploaded,
             unavailableSources = unavailableSources,
+            sourceUploadFailures = sourceUploadFailures,
+            serializationFallbacks = serializationFallbacks,
+            skippedRecords = skippedRecords,
             nilInstanceCount = nilCount,
-            seconds = os.clock() - started,
+            seconds = safeNumber(os.clock() - started),
         })
         if not endOk then return false, endResult end
-
         return true, endResult
     end
 
@@ -14776,22 +15052,33 @@ local function main()
 
         hasFullSnapshot = true
         lastFullSync = os.time()
+        if includeSources then lastDeepSync = lastFullSync end
         local mirrored = type(mirrorResult) == "table" and tonumber(mirrorResult.instances) or nil
+        local expected = type(mirrorResult) == "table" and tonumber(mirrorResult.expectedInstances) or nil
+        local skipped = type(mirrorResult) == "table" and tonumber(mirrorResult.skippedRecords) or 0
         local mirroredScripts = type(mirrorResult) == "table" and tonumber(mirrorResult.scripts) or nil
+        local scriptObjects = type(mirrorResult) == "table" and tonumber(mirrorResult.scriptObjects) or nil
+        local sourceCoverage = type(mirrorResult) == "table" and tonumber(mirrorResult.sourceCoveragePercent) or nil
+        local mirrorComplete = (not expected or not mirrored or expected == mirrored) and (not skipped or skipped == 0)
 
         -- Freebuff reads the trusted disk workspace directly, so there is no reason to
         -- build/send a second huge compact snapshot. Keep only current selection fresh.
         if provider == "Freebuff" then
             local selectionOk, selectionResult = Codex.SyncSelection()
             contextLabel.Text = string.format(
-                "Freebuff mirror ready: %s instances | %s scripts | workspace synced",
-                tostring(mirrored or "all"),
-                tostring(mirroredScripts or 0)
+                "Freebuff mirror: %s/%s instances | sources %s/%s%s",
+                tostring(mirrored or "?"),
+                tostring(expected or mirrored or "?"),
+                tostring(mirroredScripts or 0),
+                tostring(scriptObjects or mirroredScripts or 0),
+                sourceCoverage and (" (" .. tostring(sourceCoverage) .. "%)") or ""
             )
-            if selectionOk then
-                setStatus(includeSources and "Deep Explorer mirror ready for Freebuff" or "Explorer mirror ready for Freebuff", true)
+            if not mirrorComplete then
+                setStatus("Mirror partial: " .. tostring(mirrored or "?") .. "/" .. tostring(expected or "?") .. " | skipped " .. tostring(skipped or 0), false)
+            elseif selectionOk then
+                setStatus(includeSources and "Deep Explorer mirror complete for Freebuff" or "Explorer mirror complete for Freebuff", true)
             else
-                setStatus("Explorer mirror ready; selection sync warning: " .. tostring(selectionResult), nil)
+                setStatus("Explorer mirror complete; selection sync warning: " .. tostring(selectionResult), nil)
             end
             busy = false
             return true, mirrorResult
@@ -14805,15 +15092,19 @@ local function main()
         local stats = Codex.LastSnapshotStats or {instances = 0, scripts = 0, truncated = false}
 
         contextLabel.Text = string.format(
-            "Explorer mirror: %s instances | %s scripts | compact chat context: %d%s",
-            tostring(mirrored or "all"),
+            "Explorer mirror: %s/%s instances | sources %s/%s | compact: %d%s",
+            tostring(mirrored or "?"),
+            tostring(expected or mirrored or "?"),
             tostring(mirroredScripts or 0),
+            tostring(scriptObjects or mirroredScripts or 0),
             tonumber(stats.instances) or 0,
-            stats.truncated and " (capped; disk mirror is full)" or ""
+            stats.truncated and " (compact capped)" or ""
         )
 
-        if contextOk then
-            setStatus(includeSources and "Deep Explorer mirror ready" or "Explorer mirror ready", true)
+        if not mirrorComplete then
+            setStatus("Mirror partial: " .. tostring(mirrored or "?") .. "/" .. tostring(expected or "?") .. " | skipped " .. tostring(skipped or 0), false)
+        elseif contextOk then
+            setStatus(includeSources and "Deep Explorer mirror complete" or "Explorer mirror complete", true)
         else
             -- Do NOT fail the sync. Codex can still read dex/tree.txt, instances.jsonl,
             -- services/*.jsonl and scripts/*.luau from the trusted workspace.
@@ -14865,6 +15156,53 @@ local function main()
         end)
     end
 
+    local function addChoiceButtons(choices)
+        if not messages or type(choices) ~= "table" or #choices == 0 then return end
+        local holder = Instance.new("Frame")
+        holder.BackgroundTransparency = 1
+        holder.Size = UDim2.new(1, -10, 0, 28)
+        holder.AutomaticSize = Enum.AutomaticSize.Y
+        holder.Parent = messages
+
+        local layout = Instance.new("UIListLayout", holder)
+        layout.FillDirection = Enum.FillDirection.Horizontal
+        layout.Padding = UDim.new(0, 6)
+        layout.Wraps = true
+
+        for i = 1, math.min(#choices, 4) do
+            local choice = sanitizeString(choices[i], 180)
+            local b = Instance.new("TextButton")
+            b.AutoButtonColor = false
+            b.BackgroundColor3 = Settings.Theme.Button
+            b.BorderSizePixel = 0
+            b.Font = Enum.Font.SourceSans
+            b.TextSize = 12
+            b.TextColor3 = Settings.Theme.Text
+            b.Text = choice
+            b.AutomaticSize = Enum.AutomaticSize.X
+            b.Size = UDim2.new(0, 120, 0, 26)
+            b.Parent = holder
+            local pad = Instance.new("UIPadding", b)
+            pad.PaddingLeft = UDim.new(0, 10)
+            pad.PaddingRight = UDim.new(0, 10)
+            local corner = Instance.new("UICorner", b)
+            corner.CornerRadius = UDim.new(0, 5)
+            b.MouseEnter:Connect(function() b.BackgroundColor3 = Settings.Theme.ButtonHover end)
+            b.MouseLeave:Connect(function() b.BackgroundColor3 = Settings.Theme.Button end)
+            b.MouseButton1Click:Connect(function()
+                if inputBox then
+                    inputBox.Text = choice
+                    inputBox:CaptureFocus()
+                    inputBox.CursorPosition = #inputBox.Text + 1
+                end
+            end)
+        end
+
+        task.defer(function()
+            messages.CanvasPosition = Vector2.new(0, math.max(0, messages.AbsoluteCanvasSize.Y))
+        end)
+    end
+
     local function currentProvider()
         return provider == "Freebuff" and "Freebuff" or "Codex"
     end
@@ -14888,6 +15226,9 @@ local function main()
         end
         if newThreadButton then
             newThreadButton.Text = provider == "Freebuff" and "Open Freebuff" or "New Chat"
+        end
+        if freebuffCheckButton then
+            freebuffCheckButton.Visible = provider == "Freebuff"
         end
         if window then
             window:SetTitle("AI Assistant - " .. currentProvider())
@@ -14923,16 +15264,28 @@ local function main()
         end
 
         addMessage("You", message)
-        setStatus("Syncing selection for Freebuff...", nil)
 
+        local ttl = tonumber(cfg("FullSnapshotTTL", 300)) or 300
+        if cfg("AutoDeepSyncFreebuff", true) == true and (lastDeepSync == 0 or (os.time() - lastDeepSync) > ttl) then
+            setStatus("Freebuff: refreshing full Explorer + script mirror...", nil)
+            local mirrorOk, mirrorResult = Codex.SyncExplorerMirror(true, true)
+            if mirrorOk then
+                hasFullSnapshot = true
+                lastFullSync = os.time()
+                lastDeepSync = lastFullSync
+                local instances = type(mirrorResult) == "table" and mirrorResult.instances or "all"
+                local scripts = type(mirrorResult) == "table" and mirrorResult.scripts or 0
+                addMessage("Freebuff", "Full trusted mirror refreshed: " .. tostring(instances) .. " instances, " .. tostring(scripts) .. " readable script sources.")
+            else
+                addMessage("Freebuff", "Deep mirror refresh warning: " .. tostring(mirrorResult) .. ". I will still stage the request using the latest available mirror.")
+            end
+        end
+
+        setStatus("Syncing selection for Freebuff...", nil)
         local selection = Codex.BuildSelectionContext()
         local syncOk, syncErr = syncPayload("selection", selection)
         if not syncOk then
-            addMessage("Freebuff", "Cannot sync Dex context: " .. tostring(syncErr))
-            setStatus("Bridge unavailable", false)
-            busy = false
-            if sendButton then sendButton.Text = "Stage" sendButton.Active = true end
-            return
+            addMessage("Freebuff", "Selection sync warning: " .. tostring(syncErr) .. ". The full disk mirror remains usable if Deep Sync succeeded.")
         end
 
         local ok, result = requestBridge("/freebuff/prompt", "POST", {
@@ -14976,8 +15329,39 @@ local function main()
         end
 
         addMessage("You", message)
-        setStatus("Syncing selected Dex context...", nil)
 
+        local ttl = tonumber(cfg("FullSnapshotTTL", 300)) or 300
+        local lowerMessage = string.lower(message)
+        local sourceWords = {"script", "module", "source", "luau", "lua", "code", "localscript", "modulescript", "mã nguồn", "đọc mã"}
+        local wantsDeep = false
+        if cfg("AutoDeepSyncCodexForScriptQueries", true) == true then
+            for i = 1, #sourceWords do
+                if string.find(lowerMessage, sourceWords[i], 1, true) then wantsDeep = true break end
+            end
+        end
+
+        if wantsDeep and (lastDeepSync == 0 or (os.time() - lastDeepSync) > ttl) then
+            setStatus("Refreshing full Explorer + script source mirror...", nil)
+            local mirrorOk, mirrorResult = Codex.SyncExplorerMirror(true, true)
+            if mirrorOk then
+                hasFullSnapshot = true
+                lastFullSync = os.time()
+                lastDeepSync = lastFullSync
+            else
+                addMessage("Codex", "Deep mirror refresh warning: " .. tostring(mirrorResult) .. ". Live Dex queries remain available.")
+            end
+        elseif cfg("AutoMirrorBeforeCodexChat", true) == true and (lastFullSync == 0 or (os.time() - lastFullSync) > ttl) then
+            setStatus("Refreshing full Explorer metadata mirror...", nil)
+            local mirrorOk, mirrorResult = Codex.SyncExplorerMirror(false, false)
+            if mirrorOk then
+                hasFullSnapshot = true
+                lastFullSync = os.time()
+            else
+                addMessage("Codex", "Full mirror refresh warning: " .. tostring(mirrorResult) .. ". Live Dex queries remain available.")
+            end
+        end
+
+        setStatus("Syncing selected Dex context...", nil)
         local selection = Codex.BuildSelectionContext()
         local syncOk, syncErr = syncPayload("selection", selection)
         if not syncOk then
@@ -15009,15 +15393,19 @@ local function main()
         if ok then
             local maxHops = tonumber(cfg("MaxToolHops", 8)) or 8
             local hops = 0
-            while type(result) == "table" and result.dexQuery and hops < maxHops do
+            while type(result) == "table" and (result.dexQuery or result.dexQueries) and hops < maxHops do
                 hops += 1
-                local q = result.dexQuery
-                local qName = type(q) == "table" and tostring(q.op or q.operation or "read") or "read"
-                setStatus("Codex reading Dex: " .. qName .. "...", nil)
-                local toolResult = Codex.ExecuteQuery(q)
+                local queries = type(result.dexQueries) == "table" and result.dexQueries or {result.dexQuery}
+                local names = {}
+                for i = 1, math.min(#queries, tonumber(cfg("MaxToolBatch", 8)) or 8) do
+                    local q = queries[i]
+                    names[#names + 1] = type(q) == "table" and tostring(q.op or q.operation or "read") or "read"
+                end
+                setStatus("Codex reading Dex: " .. table.concat(names, ", ") .. "...", nil)
+                local toolResults = Codex.ExecuteQueries(queries)
                 local nextOk, nextResult = requestBridge("/chat", "POST", {
-                    toolResult = toolResult,
-                    toolQuery = q,
+                    toolResults = toolResults,
+                    toolQueries = queries,
                     continuation = true,
                     placeId = game.PlaceId,
                     jobId = game.JobId,
@@ -15031,12 +15419,15 @@ local function main()
             end
 
             if ok then
-                if type(result) == "table" and result.dexQuery then
+                if type(result) == "table" and (result.dexQuery or result.dexQueries) then
                     addMessage("Codex", "Dex query limit reached before Codex produced a final answer.")
                     setStatus("Tool-hop limit reached", false)
                 else
                     local answer = type(result) == "table" and (result.answer or result.text or result.response) or tostring(result)
                     addMessage("Codex", answer or "(empty response)")
+                    if type(result) == "table" and type(result.choices) == "table" then
+                        addChoiceButtons(result.choices)
+                    end
                     setStatus("Ready", true)
                 end
             else
@@ -15060,10 +15451,16 @@ local function main()
             local ok, result = requestBridge("/freebuff/status", "GET")
             if ok then
                 local installed = type(result) == "table" and result.installed
+                local launched = type(result) == "table" and result.launched
+                local mirrorReady = type(result) == "table" and result.mirrorReady
                 if installed then
-                    setStatus("Bridge online / Freebuff installed", true)
+                    if launched then
+                        setStatus(mirrorReady and "Bridge ✓ | Freebuff opened | choose model in terminal" or "Bridge ✓ | Freebuff opened | mirror not synced", mirrorReady and true or nil)
+                    else
+                        setStatus(mirrorReady and "Bridge ✓ | Freebuff ready | mirror synced" or "Bridge ✓ | Freebuff ready | press Deep Sync", true)
+                    end
                 else
-                    setStatus("Bridge online / Freebuff not found", false)
+                    setStatus("Bridge ✓ | Freebuff command not found", false)
                 end
             else
                 setStatus("Bridge offline: " .. tostring(result), false)
@@ -15085,12 +15482,52 @@ local function main()
         return ok, result
     end
 
+    function Codex.CheckFreebuffResponse(silent)
+        local ok, result = requestBridge("/freebuff/response", "GET")
+        if not ok then
+            if not silent then
+                addMessage("Freebuff", "Cannot check response: " .. tostring(result))
+                setStatus("Freebuff response check failed", false)
+            end
+            return false, result
+        end
+        if type(result) ~= "table" or result.available ~= true then
+            if not silent then
+                addMessage("Freebuff", "No FREEBUFF_RESPONSE.json yet. In the Freebuff terminal, choose a model and ask it to read FREEBUFF_REQUEST.md; the request tells it to write the answer back for Dex.")
+                setStatus("Waiting for Freebuff answer", nil)
+            end
+            return true, result
+        end
+        local responseId = tostring(result.responseId or result.requestId or result.updatedAt or "response")
+        if responseId ~= lastFreebuffResponseId then
+            lastFreebuffResponseId = responseId
+            addMessage("Freebuff", tostring(result.answer or "(empty Freebuff response)"))
+            if type(result.choices) == "table" then addChoiceButtons(result.choices) end
+            if type(result.actions) == "table" and #result.actions > 0 then
+                local safeActions = {}
+                for i = 1, math.min(#result.actions, 4) do
+                    local action = result.actions[i]
+                    local op = type(action) == "table" and tostring(action.op or action.operation or "") or ""
+                    if op == "select_instance" or op == "view_instance" or op == "open_script" then
+                        safeActions[#safeActions + 1] = action
+                    end
+                end
+                if #safeActions > 0 then
+                    local actionResults = Codex.ExecuteQueries(safeActions)
+                    addMessage("AI", "Applied " .. tostring(#safeActions) .. " safe Dex UI action(s) from Freebuff.")
+                end
+            end
+        end
+        setStatus("Freebuff answer received", true)
+        return true, result
+    end
+
     function Codex.NewThread()
         if provider == "Freebuff" then
             local ok, result = requestBridge("/freebuff/open", "POST", {})
             if ok then
                 addMessage("Freebuff", "Opened Freebuff in the trusted Dex mirror workspace. It can read dex/tree.txt, dex/instances.jsonl, dex/services/* and dex/scripts/* from the latest Sync/Deep Sync.")
-                setStatus("Freebuff opened", true)
+                setStatus("Freebuff opened — choose a model in the terminal", true)
             else
                 addMessage("Freebuff", "Could not open Freebuff: " .. tostring(result))
                 setStatus("Freebuff launch failed", false)
@@ -15160,6 +15597,8 @@ local function main()
         syncButton = makeButton(top, "Sync Dex", 4, 76, 30, 22)
         deepSyncButton = makeButton(top, "Deep Sync", 84, 84, 30, 22)
         newThreadButton = makeButton(top, "New Chat", 172, 92, 30, 22)
+        freebuffCheckButton = makeButton(top, "Check Answer", 268, 96, 30, 22)
+        freebuffCheckButton.Visible = false
 
         statusLabel = Instance.new("TextLabel")
         statusLabel.BackgroundTransparency = 1
@@ -15287,6 +15726,11 @@ local function main()
             task.spawn(Codex.NewThread)
         end)
 
+        freebuffCheckButton.MouseButton1Click:Connect(function()
+            if busy or provider ~= "Freebuff" then return end
+            task.spawn(function() Codex.CheckFreebuffResponse(false) end)
+        end)
+
         if Explorer and Explorer.Selection and Explorer.Selection.Changed then
             Explorer.Selection.Changed:Connect(function()
                 local count = #Explorer.Selection.List
@@ -15294,9 +15738,22 @@ local function main()
             end)
         end
 
-        addMessage("AI", "Dex++ AI Assistant loaded. Choose Codex for embedded chat, or Freebuff for trusted-folder mode. Both providers use the same Full Explorer mirror. Deep Sync additionally exports readable properties and script sources available to the current Dex environment.")
+        addMessage("AI", "Dex++ AI Assistant v1.5 loaded. Codex can read the complete synced Explorer and query live Dex in paginated/batched steps; Freebuff uses the same trusted full mirror. Deep Sync exports properties and complete readable script sources in source chunks. Safe Dex UI navigation can be performed when explicitly requested.")
         updateProviderVisuals()
         task.spawn(Codex.Health)
+        -- Keep status live. This fixes the confusing case where Freebuff is launched
+        -- after Dex initially reported the bridge as offline.
+        task.spawn(function()
+            while window and window.GuiElems and window.GuiElems.Main and window.GuiElems.Main.Parent do
+                task.wait(3)
+                if not busy then
+                    Codex.Health()
+                    if provider == "Freebuff" then
+                        Codex.CheckFreebuffResponse(true)
+                    end
+                end
+            end
+        end)
     end
 
     return Codex
@@ -15434,12 +15891,19 @@ DefaultSettings = (function()
 			MaxSelectedInstances = 20,
 			MaxChildrenInDetail = 300,
 			MaxSourceLength = 60000,
-			MaxStringLength = 4096,
+			MaxStringLength = 32768,
 			MaxChatMessageLength = 24000,
 			FullSnapshotTTL = 300,
-			MaxToolHops = 8,
-			MirrorChunkSize = 100,
-			MirrorPropertiesPerInstance = 160,
+			MaxToolHops = 12,
+			MaxToolBatch = 8,
+			MaxToolPageSize = 500,
+			ToolSourceChunkBytes = 48000,
+			AutoMirrorBeforeCodexChat = true,
+			AutoDeepSyncCodexForScriptQueries = true,
+			AutoDeepSyncFreebuff = true,
+			MirrorChunkSize = 40,
+			MirrorSourceChunkBytes = 48000,
+			MirrorPropertiesPerInstance = 0, -- 0 = every readable API property; large strings can be paged live with get_property
 			MirrorIncludeNilInstances = false,
 		},
 		Window = {
