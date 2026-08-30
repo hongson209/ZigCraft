@@ -14131,7 +14131,7 @@ local function main()
     local hasFullSnapshot = false
     local lastFullSync = 0
 
-    Codex.Version = "1.0.0"
+    Codex.Version = "1.1.0"
     Codex.Window = nil
     Codex.LastSnapshotStats = nil
 
@@ -14538,6 +14538,134 @@ local function main()
         }
     end
 
+    local function getTopServiceName(obj)
+        if obj == game then return "DataModel" end
+        local current = obj
+        local last = obj
+        local guard = 0
+        while current and current ~= game and guard < 256 do
+            last = current
+            current = current.Parent
+            guard += 1
+        end
+        return (last and last.Name) or "Unknown"
+    end
+
+    local function mirrorRecord(obj, includeProperties, includeSource)
+        local record = basicInstanceRecord(obj)
+        record.service = getTopServiceName(obj)
+        if includeProperties then
+            record.properties = getReadableProperties(obj, cfg("MirrorPropertiesPerInstance", cfg("MaxPropertiesPerInstance", 160)))
+        end
+        if includeSource and (obj:IsA("LocalScript") or obj:IsA("ModuleScript") or obj:IsA("Script")) then
+            local source, err = decompileScript(obj)
+            record.source = source
+            record.sourceError = err
+        end
+        return record
+    end
+
+    -- Creates a disk-backed mirror of every Instance currently visible to Dex.
+    -- Unlike BuildFullSnapshot, this has no artificial instance count cap.
+    -- Data is uploaded in small chunks so large places do not require one huge HTTP body.
+    function Codex.SyncExplorerMirror(includeSources, includeProperties)
+        if not env.request then return false, "Executor does not expose an HTTP request function." end
+
+        local started = os.clock()
+        local chunkSize = math.clamp(tonumber(cfg("MirrorChunkSize", 100)) or 100, 10, 500)
+        local includeNil = cfg("MirrorIncludeNilInstances", false) == true
+        local roots = {game}
+        local okDesc, descendants = pcall(game.GetDescendants, game)
+        if not okDesc then return false, tostring(descendants) end
+        for i = 1, #descendants do roots[#roots + 1] = descendants[i] end
+
+        local nilCount = 0
+        if includeNil and env.getnilinstances then
+            local okNil, nils = pcall(env.getnilinstances)
+            if okNil and type(nils) == "table" then
+                for i = 1, #nils do
+                    roots[#roots + 1] = nils[i]
+                    nilCount += 1
+                end
+            end
+        end
+
+        local beginOk, beginResult = requestBridge("/mirror/begin", "POST", {
+            schema = "dexpp.mirror.v1",
+            placeId = game.PlaceId,
+            jobId = game.JobId,
+            dexVersion = tostring(Main.Version),
+            integrationVersion = Codex.Version,
+            includeSources = includeSources == true,
+            includeProperties = includeProperties == true,
+            includeNilInstances = includeNil,
+            expectedInstances = #roots,
+        })
+        if not beginOk then return false, beginResult end
+
+        local sessionId = type(beginResult) == "table" and beginResult.sessionId or nil
+        if not sessionId then return false, "bridge did not return mirror session id" end
+
+        local sent = 0
+        local scripts = 0
+        local unavailableSources = 0
+        local chunk = {}
+
+        local function flush()
+            if #chunk == 0 then return true end
+            local ok, result = requestBridge("/mirror/chunk", "POST", {
+                sessionId = sessionId,
+                records = chunk,
+            })
+            if not ok then return false, result end
+            sent += #chunk
+            table.clear(chunk)
+            return true, result
+        end
+
+        for i = 1, #roots do
+            local obj = roots[i]
+            local okRecord, record = pcall(mirrorRecord, obj, includeProperties == true, includeSources == true)
+            if okRecord and record then
+                if includeSources and (obj:IsA("LocalScript") or obj:IsA("ModuleScript") or obj:IsA("Script")) then
+                    scripts += 1
+                    if not record.source then unavailableSources += 1 end
+                end
+                chunk[#chunk + 1] = record
+            end
+
+            if #chunk >= chunkSize then
+                setStatus(string.format("Mirroring Explorer... %d/%d", math.min(i, #roots), #roots), nil)
+                local okFlush, flushResult = flush()
+                if not okFlush then
+                    requestBridge("/mirror/abort", "POST", {sessionId = sessionId})
+                    return false, flushResult
+                end
+                task.wait()
+            elseif i % 50 == 0 then
+                task.wait()
+            end
+        end
+
+        local okFlush, flushResult = flush()
+        if not okFlush then
+            requestBridge("/mirror/abort", "POST", {sessionId = sessionId})
+            return false, flushResult
+        end
+
+        local endOk, endResult = requestBridge("/mirror/end", "POST", {
+            sessionId = sessionId,
+            sentInstances = sent,
+            scriptCount = scripts,
+            unavailableSources = unavailableSources,
+            nilInstanceCount = nilCount,
+            seconds = os.clock() - started,
+        })
+        if not endOk then return false, endResult end
+
+        return true, endResult
+    end
+
     function Codex.BuildFullSnapshot(includeSources)
         local started = os.clock()
         local maxInstances = tonumber(cfg("MaxInstances", 12000)) or 12000
@@ -14631,30 +14759,42 @@ local function main()
     function Codex.SyncFull(includeSources)
         if busy then return false, "busy" end
         busy = true
-        setStatus(includeSources and "Building deep Dex snapshot..." or "Building Dex snapshot...", nil)
 
+        -- First keep the compact context used by the embedded Codex chat.
+        setStatus(includeSources and "Building deep Dex context..." or "Building Dex context...", nil)
         local snapshot = Codex.BuildFullSnapshot(includeSources)
-        setStatus("Sending snapshot to Codex bridge...", nil)
-        local ok, result = syncPayload("full", snapshot)
+        local contextOk, contextResult = syncPayload("full", snapshot)
+        if not contextOk then
+            setStatus("Context sync failed: " .. tostring(contextResult), false)
+            busy = false
+            return false, contextResult
+        end
 
-        if ok then
+        -- Then mirror the ENTIRE Explorer to the trusted disk workspace.
+        -- Sync Dex = full tree/attributes/tags; Deep Sync = + readable properties + accessible sources.
+        setStatus(includeSources and "Deep mirroring full Explorer..." or "Mirroring full Explorer...", nil)
+        local mirrorOk, mirrorResult = Codex.SyncExplorerMirror(includeSources == true, includeSources == true)
+
+        if mirrorOk then
             hasFullSnapshot = true
             lastFullSync = os.time()
             local stats = Codex.LastSnapshotStats
+            local mirrored = type(mirrorResult) == "table" and tonumber(mirrorResult.instances) or nil
+            local mirroredScripts = type(mirrorResult) == "table" and tonumber(mirrorResult.scripts) or nil
             contextLabel.Text = string.format(
-                "Full Dex: %d instances | %d sources | %.2fs%s",
+                "Explorer mirror: %s instances | %s scripts | compact context: %d%s",
+                tostring(mirrored or "all"),
+                tostring(mirroredScripts or (includeSources and stats.scripts or 0)),
                 stats.instances,
-                stats.scripts,
-                stats.seconds,
-                stats.truncated and " | truncated" or ""
+                stats.truncated and " (chat snapshot capped; disk mirror is not)" or ""
             )
-            setStatus("Codex context ready", true)
+            setStatus(includeSources and "Deep Explorer mirror ready" or "Explorer mirror ready", true)
         else
-            setStatus("Sync failed: " .. tostring(result), false)
+            setStatus("Mirror failed: " .. tostring(mirrorResult), false)
         end
 
         busy = false
-        return ok, result
+        return mirrorOk, mirrorResult
     end
 
     local function addMessage(role, text)
@@ -14877,7 +15017,7 @@ local function main()
         contextLabel.TextSize = 12
         contextLabel.TextXAlignment = Enum.TextXAlignment.Left
         contextLabel.TextColor3 = Settings.Theme.PlaceholderText
-        contextLabel.Text = "Context: selection auto-sync | Sync Dex = full tree | Deep Sync = accessible script sources"
+        contextLabel.Text = "Sync Dex = ALL Explorer to trusted folder | Deep Sync = + properties + accessible script sources"
         contextLabel.Position = UDim2.new(0, 8, 0, 39)
         contextLabel.Size = UDim2.new(1, -16, 0, 18)
         contextLabel.Parent = content
@@ -14981,7 +15121,7 @@ local function main()
             end)
         end
 
-        addMessage("Codex", "Dex++ Codex integration loaded. Press Sync Dex once, then ask about the current selection or any object in the synced Explorer tree.")
+        addMessage("Codex", "Dex++ AI Mirror loaded. Sync Dex mirrors the complete Explorer visible to Dex into the trusted workspace. Deep Sync additionally exports readable properties and script sources available to the current Dex environment.")
         task.spawn(Codex.Health)
     end
 
@@ -15121,6 +15261,9 @@ DefaultSettings = (function()
 			MaxChatMessageLength = 24000,
 			FullSnapshotTTL = 300,
 			MaxToolHops = 8,
+			MirrorChunkSize = 100,
+			MirrorPropertiesPerInstance = 160,
+			MirrorIncludeNilInstances = false,
 		},
 		Window = {
 			TitleOnMiddle = false,
