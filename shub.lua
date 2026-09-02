@@ -1,12 +1,12 @@
 --[[
 	Dex++ hongson Edition
-	Version 3.2 - Claude Code Full Context
+	Version 3.4 - DexBridge Explorer Converter
 
 	Cleaned & modified by hongson
 	Based on Dex++ 3.0
 
-	Claude Code bridge integration, custom Anthropic-compatible endpoint support,
-	and local workspace export via the bundled Windows .bat bridge.
+	Bridge-based one-click export of the accessible Roblox Explorer to a local desktop
+	DexBridge with live progress, detailed Explorer metadata and full UI properties.
 ]]
 
 local selection
@@ -14086,19 +14086,24 @@ else
 	return {InitDeps = initDeps, InitAfterMain = initAfterMain, Main = main}
 end
 end,
-["ClaudeCode"] = function()
+["Exporter"] = function()
 --[[
-    Dex++ Claude Code Integration v5 - make by hongson
+    Dex++ DexBridge Exporter v7 - make by hongson
 
-    Compatibility note:
-      The embedded module key remains "ClaudeCode" because the legacy Dex++ loader
-      references Apps.ClaudeCode. User-facing behavior is Claude Code only.
+    One-click client-visible Explorer export through a localhost bridge.
+    The bridge writes a detailed Explorer snapshot directly beside DexBridge,
+    while showing conversion progress on the desktop.
 
-    Transport:
-      Dex++ (Luau) -> localhost bridge -> Claude Code CLI -> local workspace
+    Balanced mode:
+      - every accessible Instance: hierarchy, class, parent, service, attributes
+      - class-relevant properties for non-UI objects
+      - FULL API-readable properties for UI/GUI objects
+      - UI is indexed separately by the bridge
 
-    API credentials stay in the local bridge process. Dex++ only talks to
-    127.0.0.1 and never stores the Claude API token in this Luau source.
+    Deep mode:
+      - every API-readable property for every accessible Instance
+
+    Readable script source is optional and controlled by the local DexBridge UI.
 ]]
 
 local Main,Lib,Apps,Settings
@@ -14126,148 +14131,63 @@ local function initAfterMain()
 end
 
 local function main()
-    local ClaudeCode = {}
+    local Exporter = {}
     local HttpService = service.HttpService
     local window
-    local statusLabel, contextLabel, messages, inputBox, sendButton
-    local syncButton, deepSyncButton, newThreadButton
-    local claudeProviderButton, openClaudeButton, openWorkspaceButton
+    local statusLabel, detailLabel, exportButton, deepButton, testButton
+    local progressFill, progressText
     local busy = false
-    local pathIndex = setmetatable({}, {__mode = "v"})
-    local hasFullSnapshot = false
-    local lastFullSync = 0
-    local lastDeepSync = 0
-    local liveRootsCache = nil
-    local liveRootsDirty = true
     local sourceCache = setmetatable({}, {__mode = "k"})
-    local descendantsCache = setmetatable({}, {__mode = "k"})
-    local searchCache = {}
-    local liveRevision = 0
-    local submitSerial = 0
-    local composerHeight = 40
-    local startupResearchDone = false
-    local startupResearchRunning = false
-    local lastMirroredRevision = -1
+    local pathCache = setmetatable({}, {__mode = "k"})
 
-    ClaudeCode.Version = "5.0.0-hongson"
-    ClaudeCode.Window = nil
-    ClaudeCode.LastSnapshotStats = nil
+    Exporter.Version = "7.0.0-hongson"
+    Exporter.Window = nil
+    Exporter.LastResult = nil
 
     local function cfg(name, fallback)
-        local c = Settings.ClaudeCode or {}
+        local c = Settings.Exporter or {}
         local value = c[name]
         if value == nil then return fallback end
         return value
     end
 
-    local function setStatus(text, ok)
-        if statusLabel then
-            statusLabel.Text = tostring(text)
-            if ok == true then
-                statusLabel.TextColor3 = Color3.fromRGB(120, 220, 150)
-            elseif ok == false then
-                statusLabel.TextColor3 = Color3.fromRGB(240, 120, 120)
-            else
-                statusLabel.TextColor3 = Settings.Theme.Text
-            end
-        end
-    end
-
-    local function bridgeUrl(path)
-        local base = tostring(cfg("BridgeUrl", "http://127.0.0.1:32187"))
-        base = base:gsub("/+$", "")
-        return base .. path
-    end
-
-    local function requestBridge(path, method, body)
-        if not env.request then
-            return false, "Executor does not expose an HTTP request function."
-        end
-
-        local req = {
-            Url = bridgeUrl(path),
-            Method = method or "GET",
-            Headers = {
-                ["Content-Type"] = "application/json",
-                ["X-Dex-ClaudeCode-Client"] = "Dex++/" .. tostring(ClaudeCode.Version),
-            },
-        }
-
-        if body ~= nil then
-            local okEncode, encoded = pcall(HttpService.JSONEncode, HttpService, body)
-            if not okEncode then
-                return false, "JSON encode failed for " .. tostring(path) .. ": " .. tostring(encoded)
-            end
-            req.Body = encoded
-        end
-
-        local ok, response = pcall(env.request, req)
-        if not ok then
-            return false, tostring(response)
-        end
-
-        local statusCode = tonumber(response.StatusCode or response.Status or 0) or 0
-        local rawBody = response.Body or response.body or ""
-        local decoded
-        if rawBody ~= "" then
-            pcall(function()
-                decoded = HttpService:JSONDecode(rawBody)
-            end)
-        end
-
-        if statusCode < 200 or statusCode >= 300 then
-            local message = decoded and (decoded.error or decoded.message)
-            return false, tostring(message or rawBody or ("HTTP " .. tostring(statusCode)))
-        end
-
-        return true, decoded or rawBody
-    end
-
-    local function sanitizeString(value, maxLen)
-        value = tostring(value or "")
-        maxLen = maxLen or 4096
-
-        -- HttpService:JSONEncode rejects malformed UTF-8. Decompiled source or
-        -- unusual executor-returned strings can contain arbitrary bytes, so keep
-        -- valid UTF-8 untouched and fall back to a conservative ASCII-safe copy.
-        local validUtf8 = false
-        if utf8 and utf8.len then
-            local okUtf8, lenUtf8 = pcall(utf8.len, value)
-            validUtf8 = okUtf8 and lenUtf8 ~= nil
+    local function setStatus(text, state)
+        if not statusLabel then return end
+        statusLabel.Text = tostring(text or "")
+        if state == true then
+            statusLabel.TextColor3 = Color3.fromRGB(86, 205, 120)
+        elseif state == false then
+            statusLabel.TextColor3 = Color3.fromRGB(240, 100, 100)
         else
-            validUtf8 = true
+            statusLabel.TextColor3 = Settings.Theme.Text
         end
-        if not validUtf8 then
-            local out = table.create(math.min(#value, maxLen))
-            local lim = math.min(#value, maxLen)
-            for i = 1, lim do
-                local b = string.byte(value, i)
-                if b == 9 or b == 10 or b == 13 or (b >= 32 and b <= 126) then
-                    out[#out + 1] = string.char(b)
-                else
-                    out[#out + 1] = "?"
-                end
-            end
-            value = table.concat(out)
-        end
-
-        if #value > maxLen then
-            return value:sub(1, maxLen) .. "\n...[truncated " .. tostring(#value - maxLen) .. " chars]"
-        end
-        return value
     end
 
-    local function sanitizeUtf8String(value)
-        value = tostring(value or "")
-        local validUtf8 = false
-        if utf8 and utf8.len then
-            local okUtf8, lenUtf8 = pcall(utf8.len, value)
-            validUtf8 = okUtf8 and lenUtf8 ~= nil
-        else
-            validUtf8 = true
-        end
-        if validUtf8 then return value end
+    local function setDetail(text)
+        if detailLabel then detailLabel.Text = tostring(text or "") end
+    end
 
+    local function setProgress(processed, total, stage)
+        processed = tonumber(processed) or 0
+        total = tonumber(total) or 0
+        local percent = total > 0 and math.clamp((processed / total) * 100, 0, 100) or 0
+        if progressFill then
+            progressFill.Size = UDim2.new(percent / 100, 0, 1, 0)
+        end
+        if progressText then
+            progressText.Text = string.format("%.1f%%", percent)
+        end
+        if stage then setStatus(stage, nil) end
+    end
+
+    local function sanitizeUtf8(value)
+        value = tostring(value or "")
+        if utf8 and utf8.len then
+            local ok, length = pcall(utf8.len, value)
+            if ok and length ~= nil then return value end
+        else
+            return value
+        end
         local out = table.create(#value)
         for i = 1, #value do
             local b = string.byte(value, i)
@@ -14280,38 +14200,13 @@ local function main()
         return table.concat(out)
     end
 
-    -- Keep user prompts exactly as typed (including internal and trailing new lines).
-    -- Only normalize CRLF/CR to LF and reject an all-whitespace prompt.
-    local function normalizePrompt(value)
-        value = sanitizeUtf8String(tostring(value or ""))
-        value = value:gsub("\r\n", "\n"):gsub("\r", "\n")
-        if not value:find("%S") then return "" end
+    local function sanitizeString(value, maxLen)
+        value = sanitizeUtf8(value)
+        maxLen = tonumber(maxLen) or 32768
+        if #value > maxLen then
+            return value:sub(1, maxLen) .. "\n...[truncated " .. tostring(#value - maxLen) .. " chars]"
+        end
         return value
-    end
-
-    -- Return a UTF-8-safe byte chunk. Offsets are zero-based so the bridge/model can
-    -- paginate large script sources without silently truncating them.
-    local function byteChunk(value, offset, maxBytes)
-        value = tostring(value or "")
-        offset = math.max(0, math.floor(tonumber(offset) or 0))
-        maxBytes = math.clamp(math.floor(tonumber(maxBytes) or 48000), 1024, 262144)
-        if offset >= #value then
-            return "", offset, false, #value
-        end
-
-        local startByte = offset + 1
-        local endByte = math.min(#value, startByte + maxBytes - 1)
-        if utf8 and utf8.len and endByte < #value then
-            while endByte >= startByte do
-                local okUtf8, lenUtf8 = pcall(utf8.len, value:sub(startByte, endByte))
-                if okUtf8 and lenUtf8 ~= nil then break end
-                endByte -= 1
-            end
-        end
-        if endByte < startByte then endByte = math.min(#value, startByte + maxBytes - 1) end
-        local chunk = value:sub(startByte, endByte)
-        local nextOffset = endByte
-        return chunk, nextOffset, nextOffset < #value, #value
     end
 
     local function safeNumber(value)
@@ -14323,16 +14218,15 @@ local function main()
 
     local function serializeValue(value, depth, seen)
         depth = depth or 0
-        if depth > 4 then return "<max-depth>" end
-
+        if depth > 5 then return "<max-depth>" end
         local valueType = typeof(value)
         if valueType == "nil" or valueType == "boolean" then
             return value
         elseif valueType == "number" then
             return safeNumber(value)
         elseif valueType == "string" then
-            return sanitizeString(value, cfg("MaxStringLength", 4096))
-        elseif valueType == "EnumItem" or valueType == "BrickColor" then
+            return sanitizeString(value, cfg("MaxStringLength", 32768))
+        elseif valueType == "EnumItem" or valueType == "BrickColor" or valueType == "Font" then
             return tostring(value)
         elseif valueType == "Vector2" then
             return {x = safeNumber(value.X), y = safeNumber(value.Y)}
@@ -14348,21 +14242,20 @@ local function main()
                 y = {scale = safeNumber(value.Y.Scale), offset = safeNumber(value.Y.Offset)},
             }
         elseif valueType == "CFrame" then
-            local components = {value:GetComponents()}
-            for i = 1, #components do components[i] = safeNumber(components[i]) end
-            return {components = components}
+            local values = {value:GetComponents()}
+            for i = 1, #values do values[i] = safeNumber(values[i]) end
+            return {components = values}
         elseif valueType == "NumberRange" then
             return {min = safeNumber(value.Min), max = safeNumber(value.Max)}
-        elseif valueType == "NumberSequence" or valueType == "ColorSequence" then
-            return sanitizeString(tostring(value), 2048)
-        elseif valueType == "Rect" or valueType == "Ray" or valueType == "Region3" or valueType == "PhysicalProperties" then
-            return sanitizeString(tostring(value), 2048)
+        elseif valueType == "Rect" then
+            return {
+                min = {x = safeNumber(value.Min.X), y = safeNumber(value.Min.Y)},
+                max = {x = safeNumber(value.Max.X), y = safeNumber(value.Max.Y)},
+            }
         elseif valueType == "Instance" then
-            local path = "<instance>"
-            pcall(function()
-                path = Explorer and Explorer.GetInstancePath and Explorer.GetInstancePath(value) or value:GetFullName()
-            end)
-            return {type = "Instance", className = value.ClassName, path = path}
+            return pathCache[value] or sanitizeString(value:GetFullName(), 4096)
+        elseif valueType == "NumberSequence" or valueType == "ColorSequence" or valueType == "PhysicalProperties" then
+            return tostring(value)
         elseif valueType == "table" then
             seen = seen or {}
             if seen[value] then return "<cycle>" end
@@ -14371,7 +14264,7 @@ local function main()
             local count = 0
             for k, v in pairs(value) do
                 count += 1
-                if count > 128 then
+                if count > 160 then
                     out["<truncated>"] = true
                     break
                 end
@@ -14380,1375 +14273,461 @@ local function main()
             seen[value] = nil
             return out
         end
-
-        return sanitizeString(tostring(value), 2048)
+        return sanitizeString(tostring(value), 8192)
     end
 
-    local function getPath(obj)
-        local result = "<unknown>"
-        pcall(function()
-            if Explorer and Explorer.GetInstancePath then
-                result = Explorer.GetInstancePath(obj)
-            else
-                result = obj:GetFullName()
-            end
-        end)
-        return result
+    local function jsonEncode(value)
+        local ok, result = pcall(HttpService.JSONEncode, HttpService, value)
+        if ok then return result end
+        return nil, tostring(result)
     end
 
-    local function getAttributes(obj)
-        local result = {}
-        local ok, attrs = pcall(obj.GetAttributes, obj)
-        if ok and type(attrs) == "table" then
-            for name, value in pairs(attrs) do
-                result[name] = serializeValue(value)
-            end
-        end
-        return result
+    local function bridgeUrl(path)
+        local base = tostring(cfg("BridgeUrl", "http://127.0.0.1:32189"))
+        base = base:gsub("/+$", "")
+        return base .. path
     end
 
-    local function getTags(obj)
-        local result = {}
-        local ok, tags = pcall(service.CollectionService.GetTags, service.CollectionService, obj)
-        if ok and type(tags) == "table" then
-            for i = 1, #tags do
-                result[i] = tags[i]
-            end
+    local function requestBridge(path, method, body)
+        if not env.request then
+            return false, "Executor does not expose an HTTP request function"
         end
-        return result
-    end
-
-    local function getReadableProperties(obj, limit)
-        local result = {}
-        local className = obj.ClassName
-        local classData = API and API.Classes and API.Classes[className]
-        local count = 0
-        local used = {}
-        limit = tonumber(limit)
-        if limit == nil then limit = tonumber(cfg("MaxPropertiesPerInstance", 160)) or 160 end
-        local unlimited = limit <= 0
-
-        while classData and (unlimited or count < limit) do
-            local properties = classData.Properties or {}
-            for i = 1, #properties do
-                if not unlimited and count >= limit then break end
-                local prop = properties[i]
-                local name = prop.Name
-                if name and not used[name] and name ~= "Source" then
-                    used[name] = true
-                    local ok, value = pcall(function() return obj[name] end)
-                    if ok then
-                        result[name] = serializeValue(value)
-                        count += 1
-                    end
-                end
-            end
-            classData = classData.Superclass
-        end
-
-        return result
-    end
-
-    local function decompileScriptRaw(scr)
-        local cached = sourceCache[scr]
-        if cached then
-            if cached.ok then return cached.source, nil end
-            return nil, cached.error
-        end
-
-        if not env.decompile or not env.isViableDecompileScript or not env.isViableDecompileScript(scr) then
-            return nil, "source unavailable in current Dex environment"
-        end
-
-        local ok, source = pcall(env.decompile, scr)
-        if not ok or type(source) ~= "string" or source == "" then
-            return nil, sanitizeString(source or "decompile failed", 512)
-        end
-
-        source = sanitizeUtf8String(source)
-        sourceCache[scr] = {ok = true, source = source, bytes = #source}
-        return source, nil
-    end
-
-    -- Preview form used by selection/detail context. Full source is available through
-    -- get_script pagination and through the Deep Sync disk mirror.
-    local function decompileScript(scr)
-        local source, err = decompileScriptRaw(scr)
-        if not source then return nil, err end
-        local maxLen = tonumber(cfg("MaxSourceLength", 60000)) or 60000
-        if #source > maxLen then
-            return source:sub(1, maxLen) .. "\n...[preview truncated; use get_script pagination for the full source]", nil
-        end
-        return source, nil
-    end
-
-    local function basicInstanceRecord(obj)
-        local parentPath
-        pcall(function()
-            parentPath = obj.Parent and getPath(obj.Parent) or nil
-        end)
-
-        local path = getPath(obj)
-        pathIndex[path] = obj
-
-        return {
-            path = path,
-            name = sanitizeString(obj.Name, 512),
-            className = obj.ClassName,
-            parentPath = parentPath,
-            attributes = getAttributes(obj),
-            tags = getTags(obj),
+        local req = {
+            Url = bridgeUrl(path),
+            Method = method or "GET",
+            Headers = {
+                ["Content-Type"] = "application/json",
+                ["X-DexBridge-Client"] = "Dex++/" .. Exporter.Version,
+            },
         }
+        if body ~= nil then
+            local encoded, encodeErr = jsonEncode(body)
+            if not encoded then return false, "JSON encode failed: " .. tostring(encodeErr) end
+            req.Body = encoded
+        end
+        local ok, response = pcall(env.request, req)
+        if not ok then return false, tostring(response) end
+        local statusCode = tonumber(response.StatusCode or response.Status or 0) or 0
+        local rawBody = response.Body or response.body or ""
+        local decoded = nil
+        if rawBody ~= "" then
+            pcall(function() decoded = HttpService:JSONDecode(rawBody) end)
+        end
+        if statusCode < 200 or statusCode >= 300 then
+            local message = type(decoded) == "table" and (decoded.error or decoded.message) or rawBody
+            return false, tostring(message or ("HTTP " .. tostring(statusCode)))
+        end
+        return true, decoded or rawBody
     end
 
-    local function detailedInstanceRecord(obj, includeSource)
-        local record = basicInstanceRecord(obj)
-        record.properties = getReadableProperties(obj)
-        local okChildren, children = pcall(obj.GetChildren, obj)
-        if okChildren then
-            record.childCount = #children
-            record.children = {}
-            local maxChildren = math.min(#children, tonumber(cfg("MaxChildrenInDetail", 300)) or 300)
-            for i = 1, maxChildren do
-                local child = children[i]
-                record.children[i] = {
-                    name = child.Name,
-                    className = child.ClassName,
-                    path = getPath(child),
-                }
-            end
-            if #children > maxChildren then
-                record.childrenTruncated = #children - maxChildren
-            end
-        end
-
-        if includeSource and (obj:IsA("LocalScript") or obj:IsA("ModuleScript") or obj:IsA("Script")) then
-            local source, err = decompileScript(obj)
-            record.source = source
-            record.sourceError = err
-        end
-
-        return record
+    local function quotePathName(name)
+        return tostring(name):gsub("\\", "\\\\"):gsub("/", "\\/")
     end
 
-    local function collectRoots(includeNil)
-        -- Cache the live DataModel tree independently from nil instances. Nil instances
-        -- are appended on demand because they are executor-provided and have no reliable
-        -- DescendantAdded/Removing signal. This keeps liveRootsDirty meaningful even when
-        -- MirrorIncludeNilInstances is enabled.
-        local liveRoots = liveRootsCache
-        if not liveRoots or liveRootsDirty then
-            liveRoots = {game}
-            local ok, descendants = pcall(game.GetDescendants, game)
-            if ok and type(descendants) == "table" then
-                for i = 1, #descendants do liveRoots[#liveRoots + 1] = descendants[i] end
-            end
-            liveRootsCache = liveRoots
-            liveRootsDirty = false
+    local function buildPath(obj)
+        local cached = pathCache[obj]
+        if cached then return cached end
+        if obj == game then
+            pathCache[obj] = "game"
+            return "game"
         end
-
-        if includeNil ~= true or not env.getnilinstances then
-            return liveRoots
-        end
-
-        local roots = table.clone(liveRoots)
-        local okNil, nils = pcall(env.getnilinstances)
-        if okNil and type(nils) == "table" then
-            for i = 1, #nils do roots[#roots + 1] = nils[i] end
-        end
-        return roots
-    end
-
-    -- Explorer can be very large. Do one cheap Instance-list build only when a live
-    -- query actually needs it, then reuse the list until Roblox changes the tree.
-    pcall(function()
-        local function markTreeDirty(obj)
-            liveRootsDirty = true
-            liveRevision += 1
-            table.clear(searchCache)
-            sourceCache[obj] = nil
-            descendantsCache[obj] = nil
-        end
-        game.DescendantAdded:Connect(markTreeDirty)
-        game.DescendantRemoving:Connect(markTreeDirty)
-    end)
-
-    local function pageMeta(total, offset, count)
-        local nextOffset = offset + count
-        return {
-            total = total,
-            offset = offset,
-            count = count,
-            nextOffset = nextOffset,
-            hasMore = nextOffset < total,
-        }
-    end
-
-    function ClaudeCode.ResolvePath(path)
-        if typeof(path) == "Instance" then return path end
-        path = tostring(path or "")
-        if path == "" then return nil end
-
-        local cached = pathIndex[path]
-        if cached and cached.Parent ~= nil then return cached end
-
-        local roots = collectRoots(true)
-
-        for i = 1, #roots do
-            local obj = roots[i]
-            local objPath = getPath(obj)
-            pathIndex[objPath] = obj
-            if objPath == path then return obj end
-            if i % 300 == 0 then task.wait() end
-        end
-        return nil
-    end
-
-    local getTopServiceName
-
-    local function safeIsA(obj, className)
-        if className == "" then return true end
-        if obj.ClassName == className then return true end
-        local ok, result = pcall(obj.IsA, obj, className)
-        return ok and result == true
-    end
-
-    local function queryError(message)
-        return {ok = false, error = tostring(message)}
-    end
-
-    function ClaudeCode.ExecuteQuery(query)
-        if type(query) ~= "table" then return queryError("query must be an object") end
-        local op = tostring(query.op or query.operation or "")
-        local args = type(query.args) == "table" and query.args or query
-        local maxResults = math.clamp(tonumber(args.limit) or 100, 1, tonumber(cfg("MaxToolPageSize", 500)) or 500)
-        local offset = math.max(0, math.floor(tonumber(args.offset) or 0))
-
-        if op == "get_selection" then
-            return {ok = true, data = ClaudeCode.BuildSelectionContext()}
-        elseif op == "list_services" then
-            local out = {}
-            local children = game:GetChildren()
-            for i = 1, #children do
-                out[#out + 1] = basicInstanceRecord(children[i])
-            end
-            return {ok = true, count = #out, data = out}
-        elseif op == "search_instances" then
-            local needle = string.lower(tostring(args.query or args.name or ""))
-            local className = tostring(args.className or args.class or "")
-            local serviceName = string.lower(tostring(args.service or ""))
-            local cacheKey = table.concat({"instances", needle, string.lower(className), serviceName, args.includeNil == true and "nil" or "live", tostring(liveRevision)}, "|")
-            local matches = searchCache[cacheKey]
-            if not matches then
-                local roots = collectRoots(args.includeNil == true)
-                matches = {}
-                for i = 1, #roots do
-                    local obj = roots[i]
-                    local path = getPath(obj)
-                    pathIndex[path] = obj
-                    local nameMatch = needle == "" or string.find(string.lower(obj.Name), needle, 1, true) or string.find(string.lower(path), needle, 1, true)
-                    local classMatch = safeIsA(obj, className)
-                    local serviceMatch = serviceName == "" or string.lower(getTopServiceName(obj)) == serviceName
-                    if nameMatch and classMatch and serviceMatch then matches[#matches + 1] = obj end
-                    if i % 600 == 0 then task.wait() end
-                end
-                searchCache[cacheKey] = matches
-            end
-            local out = {}
-            for i = offset + 1, math.min(#matches, offset + maxResults) do out[#out + 1] = basicInstanceRecord(matches[i]) end
-            local meta = pageMeta(#matches, offset, #out)
-            return {ok = true, count = meta.count, total = meta.total, offset = meta.offset, nextOffset = meta.nextOffset, hasMore = meta.hasMore, data = out}
-        elseif op == "get_mirror_status" then
-            return {
-                ok = true,
-                data = {
-                    fullSyncAt = lastFullSync,
-                    deepSyncAt = lastDeepSync,
-                    hasFullSnapshot = hasFullSnapshot,
-                    liveTreeDirty = liveRootsDirty,
-                },
-            }
-        elseif op == "refresh_live_index" then
-            liveRootsDirty = true
-            liveRootsCache = nil
-            liveRevision += 1
-            table.clear(searchCache)
-            descendantsCache = setmetatable({}, {__mode = "k"})
-            pathIndex = setmetatable({}, {__mode = "v"})
-            return {ok = true, refreshed = true, revision = liveRevision}
-        elseif op == "get_scripts" then
-            local needle = string.lower(tostring(args.query or ""))
-            local serviceName = string.lower(tostring(args.service or ""))
-            local cacheKey = table.concat({"scripts", needle, serviceName, args.includeNil == true and "nil" or "live", tostring(liveRevision)}, "|")
-            local matches = searchCache[cacheKey]
-            if not matches then
-                local roots = collectRoots(args.includeNil == true)
-                matches = {}
-                for i = 1, #roots do
-                    local obj = roots[i]
-                    if obj:IsA("LocalScript") or obj:IsA("ModuleScript") or obj:IsA("Script") then
-                        local path = getPath(obj)
-                        pathIndex[path] = obj
-                        local qMatch = needle == "" or string.find(string.lower(obj.Name), needle, 1, true) or string.find(string.lower(path), needle, 1, true)
-                        local serviceMatch = serviceName == "" or string.lower(getTopServiceName(obj)) == serviceName
-                        if qMatch and serviceMatch then matches[#matches + 1] = obj end
-                    end
-                    if i % 600 == 0 then task.wait() end
-                end
-                searchCache[cacheKey] = matches
-            end
-            local out = {}
-            for i = offset + 1, math.min(#matches, offset + maxResults) do
-                local obj = matches[i]
-                out[#out + 1] = {path = getPath(obj), name = obj.Name, className = obj.ClassName, service = getTopServiceName(obj)}
-            end
-            local meta = pageMeta(#matches, offset, #out)
-            return {ok = true, count = meta.count, total = meta.total, offset = meta.offset, nextOffset = meta.nextOffset, hasMore = meta.hasMore, data = out}
-        end
-
-        local path = args.path or query.path
-        local obj = ClaudeCode.ResolvePath(path)
-        if not obj then return queryError("instance not found: " .. tostring(path)) end
-
-        if op == "get_instance" or op == "get_object" then
-            return {ok = true, data = detailedInstanceRecord(obj, args.includeSource == true)}
-        elseif op == "get_properties" then
-            return {ok = true, path = getPath(obj), data = getReadableProperties(obj, args.limit or cfg("MaxPropertiesPerInstance", 160))}
-        elseif op == "get_property" then
-            local prop = tostring(args.property or args.name or "")
-            if prop == "" then return queryError("property is required") end
-            if prop == "Source" then return queryError("use get_script for script source") end
-            local okProp, value = pcall(function() return obj[prop] end)
-            if not okProp then return queryError(value) end
-            if typeof(value) == "string" then
-                local raw = sanitizeUtf8String(value)
-                local piece, nextOffset, hasMore, totalBytes = byteChunk(raw, offset, tonumber(args.chunkBytes) or cfg("ToolSourceChunkBytes", 48000))
-                return {ok = true, path = getPath(obj), property = prop, valueType = "string", data = piece, offset = offset, nextOffset = nextOffset, hasMore = hasMore, totalBytes = totalBytes}
-            end
-            return {ok = true, path = getPath(obj), property = prop, data = serializeValue(value)}
-        elseif op == "get_attributes" then
-            return {ok = true, path = getPath(obj), data = getAttributes(obj)}
-        elseif op == "get_attribute" then
-            local attributeName = tostring(args.attribute or args.name or "")
-            if attributeName == "" then return queryError("attribute is required") end
-            local okAttr, value = pcall(obj.GetAttribute, obj, attributeName)
-            if not okAttr then return queryError(value) end
-            if typeof(value) == "string" then
-                local raw = sanitizeUtf8String(value)
-                local piece, nextOffset, hasMore, totalBytes = byteChunk(raw, offset, tonumber(args.chunkBytes) or cfg("ToolSourceChunkBytes", 48000))
-                return {ok = true, path = getPath(obj), attribute = attributeName, valueType = "string", data = piece, offset = offset, nextOffset = nextOffset, hasMore = hasMore, totalBytes = totalBytes}
-            end
-            return {ok = true, path = getPath(obj), attribute = attributeName, data = serializeValue(value)}
-        elseif op == "get_children" then
-            local okChildren, children = pcall(obj.GetChildren, obj)
-            if not okChildren then return queryError(children) end
-            local out = {}
-            for i = offset + 1, math.min(#children, offset + maxResults) do out[#out + 1] = basicInstanceRecord(children[i]) end
-            local meta = pageMeta(#children, offset, #out)
-            return {ok = true, path = getPath(obj), count = meta.count, total = meta.total, offset = meta.offset, nextOffset = meta.nextOffset, hasMore = meta.hasMore, data = out}
-        elseif op == "get_descendants" then
-            local cachedDesc = descendantsCache[obj]
-            local descendants
-            if cachedDesc and cachedDesc.revision == liveRevision then
-                descendants = cachedDesc.data
-            else
-                local okDesc, fetched = pcall(obj.GetDescendants, obj)
-                if not okDesc then return queryError(fetched) end
-                descendants = fetched
-                descendantsCache[obj] = {revision = liveRevision, data = descendants}
-            end
-            local out = {}
-            for i = offset + 1, math.min(#descendants, offset + maxResults) do
-                out[#out + 1] = basicInstanceRecord(descendants[i])
-                if i % 150 == 0 then task.wait() end
-            end
-            local meta = pageMeta(#descendants, offset, #out)
-            return {ok = true, path = getPath(obj), count = meta.count, total = meta.total, offset = meta.offset, nextOffset = meta.nextOffset, hasMore = meta.hasMore, data = out}
-        elseif op == "get_ancestors" then
-            local chain = {}
-            local current = obj.Parent
-            while current do
-                chain[#chain + 1] = basicInstanceRecord(current)
-                if current == game then break end
-                current = current.Parent
-            end
-            return {ok = true, path = getPath(obj), count = #chain, data = chain}
-        elseif op == "get_script" then
-            if not (obj:IsA("LocalScript") or obj:IsA("ModuleScript") or obj:IsA("Script")) then return queryError("target is not a script") end
-            local source, err = decompileScriptRaw(obj)
-            if not source then return {ok = false, path = getPath(obj), className = obj.ClassName, error = err} end
-            local chunk, nextOffset, hasMore, totalBytes = byteChunk(source, offset, tonumber(args.chunkBytes) or cfg("ToolSourceChunkBytes", 48000))
-            return {
-                ok = true, path = getPath(obj), className = obj.ClassName,
-                source = chunk, offset = offset, nextOffset = nextOffset, hasMore = hasMore, totalBytes = totalBytes,
-            }
-        elseif op == "get_tags" then
-            return {ok = true, path = getPath(obj), data = getTags(obj)}
-        elseif op == "select_instance" or op == "view_instance" then
-            local node = nodes and nodes[obj]
-            if not node or not Explorer or not Explorer.Selection then return queryError("instance is not present in the current Explorer tree") end
-            Explorer.Selection:Set(node)
-            Explorer.ViewNode(node)
-            return {ok = true, action = "selected", path = getPath(obj)}
-        elseif op == "open_script" then
-            if not (obj:IsA("LocalScript") or obj:IsA("ModuleScript") or obj:IsA("Script")) then return queryError("target is not a script") end
-            if not ScriptViewer or not ScriptViewer.ViewScript then return queryError("ScriptViewer unavailable") end
-            ScriptViewer.ViewScript(obj)
-            return {ok = true, action = "script_opened", path = getPath(obj)}
-        end
-
-        return queryError("unsupported Dex operation: " .. op)
-    end
-
-    function ClaudeCode.ExecuteQueries(queries)
-        if type(queries) ~= "table" then return {queryError("queries must be an array")} end
-        local out = {}
-        local maxBatch = math.clamp(tonumber(cfg("MaxToolBatch", 8)) or 8, 1, 16)
-        for i = 1, math.min(#queries, maxBatch) do
-            out[i] = ClaudeCode.ExecuteQuery(queries[i])
-            if i % 2 == 0 then task.wait() end
-        end
-        return out
-    end
-
-    function ClaudeCode.BuildSelectionContext(includeDetails, includeSource)
-        local selected = {}
-        local selectionList = Explorer and Explorer.Selection and Explorer.Selection.List or {}
-        local maxSelected = math.min(#selectionList, tonumber(cfg("MaxSelectedInstances", 20)) or 20)
-
-        for i = 1, maxSelected do
-            local node = selectionList[i]
-            local obj = node and node.Obj
-            if obj then
-                if includeDetails == true then
-                    selected[#selected + 1] = detailedInstanceRecord(obj, includeSource == true)
-                else
-                    local record = basicInstanceRecord(obj)
-                    local okChildren, children = pcall(obj.GetChildren, obj)
-                    if okChildren then record.childCount = #children end
-                    record.isScript = obj:IsA("LocalScript") or obj:IsA("ModuleScript") or obj:IsA("Script")
-                    selected[#selected + 1] = record
-                end
-            end
-        end
-
-        return {
-            schema = "dexpp.selection.v2",
-            timestamp = os.time(),
-            placeId = game.PlaceId,
-            jobId = game.JobId,
-            detailed = includeDetails == true,
-            selectedCount = #selected,
-            selected = selected,
-        }
-    end
-
-    getTopServiceName = function(obj)
-        if obj == game then return "DataModel" end
+        local chain = {}
         local current = obj
-        local last = obj
         local guard = 0
-        while current and current ~= game and guard < 256 do
+        while current and current ~= game and not pathCache[current] and guard < 512 do
+            chain[#chain + 1] = current
+            current = current.Parent
+            guard += 1
+        end
+        local base = current and pathCache[current] or "game"
+        for i = #chain, 1, -1 do
+            local item = chain[i]
+            base = base .. "/" .. quotePathName(item.Name)
+            pathCache[item] = base
+        end
+        return pathCache[obj] or base
+    end
+
+    local function depthOf(obj)
+        local depth = 0
+        local current = obj
+        while current and current ~= game and depth < 512 do
+            depth += 1
+            current = current.Parent
+        end
+        return depth
+    end
+
+    local function topServiceName(obj)
+        if obj == game then return "DataModel" end
+        local current, last, guard = obj, obj, 0
+        while current and current ~= game and guard < 512 do
             last = current
             current = current.Parent
             guard += 1
         end
-        return (last and last.Name) or "Unknown"
+        return last and last.Name or "Unknown"
     end
 
-    local function mirrorRecord(obj, includeProperties)
-        local record = basicInstanceRecord(obj)
-        record.service = getTopServiceName(obj)
-        if includeProperties then
-            record.properties = getReadableProperties(obj, cfg("MirrorPropertiesPerInstance", cfg("MaxPropertiesPerInstance", 160)))
-        end
-        return record
-    end
-
-    local function uploadMirrorSource(sessionId, obj, source)
-        local beginOk, beginResult = requestBridge("/mirror/source/begin", "POST", {
-            sessionId = sessionId,
-            path = getPath(obj),
-            name = sanitizeString(obj.Name, 512),
-            className = obj.ClassName,
-            totalBytes = #source,
-        })
-        if not beginOk then return false, beginResult end
-        local sourceId = type(beginResult) == "table" and beginResult.sourceId or nil
-        if not sourceId then return false, "bridge did not return source upload id" end
-
-        local sourceOffset = 0
-        local sequence = 0
-        local chunkBytes = tonumber(cfg("MirrorSourceChunkBytes", 48000)) or 48000
-        while sourceOffset < #source do
-            local piece, nextOffset, hasMore = byteChunk(source, sourceOffset, chunkBytes)
-            sequence += 1
-            local chunkOk, chunkResult = requestBridge("/mirror/source/chunk", "POST", {
-                sessionId = sessionId,
-                sourceId = sourceId,
-                sequence = sequence,
-                chunk = piece,
-            })
-            if not chunkOk then
-                requestBridge("/mirror/source/abort", "POST", {sessionId = sessionId, sourceId = sourceId})
-                return false, chunkResult
-            end
-            sourceOffset = nextOffset
-            if not hasMore then break end
-            task.wait()
-        end
-
-        return requestBridge("/mirror/source/end", "POST", {
-            sessionId = sessionId,
-            sourceId = sourceId,
-            totalBytes = #source,
-        })
-    end
-
-    -- Creates a disk-backed mirror of every Instance currently visible to Dex.
-    -- Unlike BuildFullSnapshot, this has no artificial instance count cap.
-    -- Data is uploaded in small chunks so large places do not require one huge HTTP body.
-    function ClaudeCode.SyncExplorerMirror(includeSources, includeProperties)
-        if not env.request then return false, "Executor does not expose an HTTP request function." end
-
-        local started = os.clock()
-        local chunkSize = math.clamp(tonumber(cfg("MirrorChunkSize", 40)) or 40, 5, 250)
-        local includeNil = cfg("MirrorIncludeNilInstances", false) == true
-        local roots = collectRoots(includeNil)
-        local nilCount = 0
-        if includeNil then
-            for i = 1, #roots do if roots[i].Parent == nil and roots[i] ~= game then nilCount += 1 end end
-        end
-
-        local beginOk, beginResult = requestBridge("/mirror/begin", "POST", {
-            schema = "dexpp.mirror.v2",
-            placeId = game.PlaceId,
-            jobId = game.JobId,
-            dexVersion = tostring(Main.Version),
-            integrationVersion = ClaudeCode.Version,
-            includeSources = includeSources == true,
-            includeProperties = includeProperties == true,
-            includeNilInstances = includeNil,
-            expectedInstances = #roots,
-        })
-        if not beginOk then return false, beginResult end
-
-        local sessionId = type(beginResult) == "table" and beginResult.sessionId or nil
-        if not sessionId then return false, "bridge did not return mirror session id" end
-
-        local sent = 0
-        local scriptObjects = 0
-        local scriptsUploaded = 0
-        local unavailableSources = 0
-        local sourceUploadFailures = 0
-        local serializationFallbacks = 0
-        local skippedRecords = 0
-        local chunk = {}
-
-        local function flush()
-            if #chunk == 0 then return true end
-            local ok, result = requestBridge("/mirror/chunk", "POST", {sessionId = sessionId, records = chunk})
-            if not ok then return false, "mirror chunk failed after " .. tostring(sent) .. " records: " .. tostring(result) end
-            sent += #chunk
-            table.clear(chunk)
-            return true, result
-        end
-
-        for i = 1, #roots do
-            local obj = roots[i]
-            local isScript = obj:IsA("LocalScript") or obj:IsA("ModuleScript") or obj:IsA("Script")
-            local source, sourceErr, sourceUploaded = nil, nil, false
-
-            if includeSources and isScript then
-                scriptObjects += 1
-                source, sourceErr = decompileScriptRaw(obj)
-                if source then
-                    setStatus(string.format("Deep Sync source %d | Explorer %d/%d", scriptObjects, i, #roots), nil)
-                    local uploadOk, uploadResult = uploadMirrorSource(sessionId, obj, source)
-                    if uploadOk then
-                        scriptsUploaded += 1
-                        sourceUploaded = true
-                    else
-                        sourceUploadFailures += 1
-                        sourceErr = "source upload failed: " .. tostring(uploadResult)
-                    end
-                else
-                    unavailableSources += 1
-                end
-            end
-
-            local okRecord, record = pcall(mirrorRecord, obj, includeProperties == true)
-            if okRecord and record then
-                if includeSources and isScript then
-                    record.sourceAvailable = sourceUploaded
-                    record.sourceBytes = source and #source or nil
-                    record.sourceError = sourceUploaded and nil or sourceErr
-                end
-
-                local okJson = pcall(HttpService.JSONEncode, HttpService, record)
-                if not okJson then
-                    serializationFallbacks += 1
-                    local okBasic, fallback = pcall(basicInstanceRecord, obj)
-                    if okBasic and fallback then
-                        fallback.service = getTopServiceName(obj)
-                        fallback.serializationWarning = "Detailed properties were omitted because this Instance could not be JSON encoded."
-                        if includeSources and isScript then
-                            fallback.sourceAvailable = sourceUploaded
-                            fallback.sourceBytes = source and #source or nil
-                            fallback.sourceError = sourceUploaded and nil or sourceErr
-                        end
-                        if pcall(HttpService.JSONEncode, HttpService, fallback) then
-                            record = fallback
-                        else
-                            record = nil
-                            skippedRecords += 1
-                        end
-                    else
-                        record = nil
-                        skippedRecords += 1
-                    end
-                end
-
-                if record then chunk[#chunk + 1] = record end
-            else
-                skippedRecords += 1
-            end
-
-            if #chunk >= chunkSize then
-                setStatus(string.format("Mirroring Explorer... %d/%d", math.min(i, #roots), #roots), nil)
-                local okFlush, flushResult = flush()
-                if not okFlush then
-                    requestBridge("/mirror/abort", "POST", {sessionId = sessionId})
-                    return false, flushResult
-                end
-                task.wait()
-            elseif i % 40 == 0 then
-                task.wait()
-            end
-        end
-
-        local okFlush, flushResult = flush()
-        if not okFlush then
-            requestBridge("/mirror/abort", "POST", {sessionId = sessionId})
-            return false, flushResult
-        end
-
-        local endOk, endResult = requestBridge("/mirror/end", "POST", {
-            sessionId = sessionId,
-            sentInstances = sent,
-            scriptObjects = scriptObjects,
-            scriptCount = scriptsUploaded,
-            unavailableSources = unavailableSources,
-            sourceUploadFailures = sourceUploadFailures,
-            serializationFallbacks = serializationFallbacks,
-            skippedRecords = skippedRecords,
-            nilInstanceCount = nilCount,
-            seconds = safeNumber(os.clock() - started),
-        })
-        if not endOk then return false, endResult end
-        return true, endResult
-    end
-
-    function ClaudeCode.BuildFullSnapshot(includeSources)
-        local started = os.clock()
-        local maxInstances = tonumber(cfg("CompactContextMaxInstances", 2500)) or 2500
-        local maxScripts = tonumber(cfg("CompactContextMaxScripts", 0)) or 0
-        local instances = {}
-        local scripts = {}
-        local truncated = false
-        local scriptCount = 0
-
-        local roots = {game}
-        local okDesc, desc = pcall(game.GetDescendants, game)
-        if okDesc then
-            for i = 1, math.min(#desc, maxInstances - 1) do
-                roots[#roots + 1] = desc[i]
-            end
-            if #desc + 1 > maxInstances then truncated = true end
-        end
-
-        for i = 1, #roots do
-            local obj = roots[i]
-            local okRecord, record = pcall(basicInstanceRecord, obj)
-            if okRecord and record then
-                instances[#instances + 1] = record
-            end
-
-            if includeSources and scriptCount < maxScripts and (obj:IsA("LocalScript") or obj:IsA("ModuleScript") or obj:IsA("Script")) then
-                scriptCount += 1
-                local source, err = decompileScript(obj)
-                scripts[#scripts + 1] = {
-                    path = getPath(obj),
-                    className = obj.ClassName,
-                    source = source,
-                    sourceError = err,
-                }
-            end
-
-            if i % 150 == 0 then
-                task.wait()
-            end
-        end
-
-        local selectionContext = ClaudeCode.BuildSelectionContext()
-        local snapshot = {
-            schema = "dexpp.snapshot.v1",
-            timestamp = os.time(),
-            placeId = game.PlaceId,
-            jobId = game.JobId,
-            gameName = "",
-            dexVersion = tostring(Main.Version),
-            claudeCodeIntegrationVersion = ClaudeCode.Version,
-            instanceCount = #instances,
-            instancesTruncated = truncated,
-            sourceSyncEnabled = includeSources and true or false,
-            scriptCount = #scripts,
-            instances = instances,
-            scripts = scripts,
-            selection = selectionContext,
-        }
-
-        pcall(function()
-            snapshot.gameName = service.MarketplaceService:GetProductInfo(game.PlaceId).Name
-        end)
-
-        ClaudeCode.LastSnapshotStats = {
-            instances = #instances,
-            scripts = #scripts,
-            seconds = os.clock() - started,
-            truncated = truncated,
-        }
-
-        return snapshot
-    end
-
-    local function syncPayload(mode, payload)
-        local ok, result = requestBridge("/sync", "POST", {
-            mode = mode,
-            payload = payload,
-        })
-        return ok, result
-    end
-
-    function ClaudeCode.SyncSelection()
-        local context = ClaudeCode.BuildSelectionContext()
-        local ok, result = syncPayload("selection", context)
-        if ok then
-            contextLabel.Text = string.format("Selection synced: %d object(s)", context.selectedCount)
-        end
-        return ok, result
-    end
-
-    function ClaudeCode.SyncFull(includeSources)
-        if busy then return false, "busy" end
-        busy = true
-
-        -- IMPORTANT: the disk mirror is the source of truth for Claude Code.
-        -- Mirror first and never block a full Explorer sync just because the optional
-        -- compact Claude Code chat snapshot fails (large executors often reject a big /sync body).
-        setStatus(includeSources and "Deep mirroring full Explorer..." or "Mirroring full Explorer...", nil)
-        local mirrorOk, mirrorResult = ClaudeCode.SyncExplorerMirror(includeSources == true, includeSources == true)
-        if not mirrorOk then
-            setStatus("Mirror failed: " .. tostring(mirrorResult), false)
-            busy = false
-            return false, mirrorResult
-        end
-
-        hasFullSnapshot = true
-        lastFullSync = os.time()
-        lastMirroredRevision = liveRevision
-        if includeSources then lastDeepSync = lastFullSync end
-        local mirrored = type(mirrorResult) == "table" and tonumber(mirrorResult.instances) or nil
-        local expected = type(mirrorResult) == "table" and tonumber(mirrorResult.expectedInstances) or nil
-        local skipped = type(mirrorResult) == "table" and tonumber(mirrorResult.skippedRecords) or 0
-        local mirroredScripts = type(mirrorResult) == "table" and tonumber(mirrorResult.scripts) or nil
-        local scriptObjects = type(mirrorResult) == "table" and tonumber(mirrorResult.scriptObjects) or nil
-        local sourceCoverage = type(mirrorResult) == "table" and tonumber(mirrorResult.sourceCoveragePercent) or nil
-        local mirrorComplete = (not expected or not mirrored or expected == mirrored) and (not skipped or skipped == 0)
-
-        -- Claude Code reads the trusted disk workspace. We still publish a compact
-        -- snapshot for compatibility/debugging, while the full mirror remains the
-        -- source of truth under dex/.
-        setStatus("Mirror ready; preparing compact Claude Code context...", nil)
-        local snapshot = ClaudeCode.BuildFullSnapshot(false)
-        local contextOk, contextResult = syncPayload("full", snapshot)
-        local stats = ClaudeCode.LastSnapshotStats or {instances = 0, scripts = 0, truncated = false}
-
-        contextLabel.Text = string.format(
-            "Explorer mirror: %s/%s instances | sources %s/%s | compact: %d%s",
-            tostring(mirrored or "?"),
-            tostring(expected or mirrored or "?"),
-            tostring(mirroredScripts or 0),
-            tostring(scriptObjects or mirroredScripts or 0),
-            tonumber(stats.instances) or 0,
-            stats.truncated and " (compact capped)" or ""
-        )
-
-        if not mirrorComplete then
-            setStatus("Mirror partial: " .. tostring(mirrored or "?") .. "/" .. tostring(expected or "?") .. " | skipped " .. tostring(skipped or 0), false)
-        elseif contextOk then
-            setStatus(includeSources and "Deep Explorer mirror complete" or "Explorer mirror complete", true)
-        else
-            -- Do NOT fail the sync. Claude Code can still read dex/tree.txt, instances.jsonl,
-            -- services/*.jsonl and scripts/*.luau from the trusted workspace.
-            setStatus("Explorer mirror ready; compact chat context skipped", true)
-        end
-
-        busy = false
-        return true, mirrorResult
-    end
-
-    local function splitDisplayText(text, chunkSize)
+    local function getAttributes(obj)
         local out = {}
-        text = sanitizeUtf8String(text)
-        chunkSize = math.max(512, tonumber(chunkSize) or 3500)
-        if text == "" then return {""} end
-
-        local cursor = 1
-        while cursor <= #text do
-            local stop = math.min(#text, cursor + chunkSize - 1)
-            if stop < #text then
-                local probe = text:sub(cursor, stop)
-                local newline = probe:match(".*()\n")
-                if newline and newline > math.floor(chunkSize * 0.55) then
-                    stop = cursor + newline - 2
-                end
-
-                -- Never split a UTF-8 codepoint between two TextLabels.
-                if utf8 and utf8.len then
-                    while stop > cursor do
-                        local okUtf8, lenUtf8 = pcall(utf8.len, text:sub(cursor, stop))
-                        if okUtf8 and lenUtf8 ~= nil then break end
-                        stop -= 1
-                    end
-                end
+        local ok, attrs = pcall(obj.GetAttributes, obj)
+        if ok and type(attrs) == "table" then
+            for name, value in pairs(attrs) do
+                out[name] = serializeValue(value)
             end
-
-            if stop < cursor then stop = math.min(#text, cursor + chunkSize - 1) end
-            out[#out + 1] = text:sub(cursor, stop)
-            cursor = stop + 1
         end
         return out
     end
 
-    local function scrollMessagesToBottom()
-        if not messages then return end
-        task.defer(function()
-            task.wait()
-            messages.CanvasPosition = Vector2.new(0, math.max(0, messages.AbsoluteCanvasSize.Y - messages.AbsoluteWindowSize.Y))
-        end)
+    local function getTags(obj)
+        local out = {}
+        local ok, tags = pcall(service.CollectionService.GetTags, service.CollectionService, obj)
+        if ok and type(tags) == "table" then
+            for i = 1, #tags do out[i] = tags[i] end
+        end
+        return out
     end
 
-    local function extractCodeBlocks(text)
-        local blocks = {}
-        if type(text) ~= "string" or text == "" then return blocks end
-
-        -- Markdown fenced code blocks. Language tag is intentionally ignored.
-        for body in text:gmatch("```[^\n]*\n(.-)```") do
-            if body and body ~= "" then
-                blocks[#blocks + 1] = body:gsub("\n$", "")
-            end
-        end
-        return blocks
+    local function tryProperty(out, obj, name)
+        local ok, value = pcall(function() return obj[name] end)
+        if ok then out[name] = serializeValue(value) end
     end
 
-    local function copyText(text, button, successLabel)
-        if not env.setclipboard then
-            setStatus("Clipboard is not supported by this executor", false)
-            return false
-        end
-
-        local ok, err = pcall(env.setclipboard, tostring(text or ""))
-        if not ok then
-            setStatus("Copy failed: " .. sanitizeString(err, 180), false)
-            return false
-        end
-
-        setStatus(successLabel or "Copied to clipboard", true)
-        if button and button.Parent then
-            local oldText = button.Text
-            button.Text = "Copied!"
-            task.delay(0.9, function()
-                if button and button.Parent then
-                    button.Text = oldText
-                end
-            end)
-        end
-        return true
+    local function isGuiRelated(obj)
+        local okGui, gui = pcall(obj.IsA, obj, "GuiBase2d")
+        if okGui and gui then return true end
+        local okLayer, layer = pcall(obj.IsA, obj, "LayerCollector")
+        if okLayer and layer then return true end
+        local className = tostring(obj.ClassName or "")
+        if className:sub(1, 2) == "UI" then return true end
+        if className == "StarterGui" or className == "CoreGui" or className == "PlayerGui" then return true end
+        if className == "ViewportFrame" or className == "CanvasGroup" then return true end
+        return false
     end
 
-    local function makeMessageActionButton(parent, text, order)
-        local button = Instance.new("TextButton")
-        button.AutoButtonColor = false
-        button.BackgroundColor3 = Settings.Theme.Button
-        button.BorderSizePixel = 0
-        button.Font = Enum.Font.SourceSans
-        button.TextSize = 11
-        button.TextColor3 = Settings.Theme.Text
-        button.Text = text
-        button.AutomaticSize = Enum.AutomaticSize.X
-        button.Size = UDim2.new(0, 52, 0, 18)
-        button.LayoutOrder = order or 1
-        button.Parent = parent
-
-        local padding = Instance.new("UIPadding")
-        padding.PaddingLeft = UDim.new(0, 7)
-        padding.PaddingRight = UDim.new(0, 7)
-        padding.Parent = button
-
-        local corner = Instance.new("UICorner")
-        corner.CornerRadius = UDim.new(0, 4)
-        corner.Parent = button
-
-        button.MouseEnter:Connect(function()
-            if button.Parent then button.BackgroundColor3 = Settings.Theme.ButtonHover end
-        end)
-        button.MouseLeave:Connect(function()
-            if button.Parent then button.BackgroundColor3 = Settings.Theme.Button end
-        end)
-        return button
+    local function getSmartProperties(obj)
+        local out = {}
+        if obj:IsA("BasePart") then
+            local names = {"Position", "Size", "CFrame", "Anchored", "CanCollide", "CanTouch", "CanQuery", "Transparency", "Material", "Color"}
+            for i = 1, #names do tryProperty(out, obj, names[i]) end
+        end
+        if obj:IsA("ValueBase") then tryProperty(out, obj, "Value") end
+        if obj:IsA("Model") then tryProperty(out, obj, "PrimaryPart") end
+        if obj:IsA("Sound") then
+            local names = {"SoundId", "Volume", "PlaybackSpeed", "Looped", "Playing", "TimePosition"}
+            for i = 1, #names do tryProperty(out, obj, names[i]) end
+        end
+        if obj:IsA("Animation") then tryProperty(out, obj, "AnimationId") end
+        if obj:IsA("Humanoid") then
+            local names = {"WalkSpeed", "JumpPower", "JumpHeight", "Health", "MaxHealth", "RigType", "HipHeight"}
+            for i = 1, #names do tryProperty(out, obj, names[i]) end
+        end
+        if obj:IsA("ProximityPrompt") then
+            local names = {"Enabled", "ActionText", "ObjectText", "KeyboardKeyCode", "GamepadKeyCode", "HoldDuration", "MaxActivationDistance", "RequiresLineOfSight"}
+            for i = 1, #names do tryProperty(out, obj, names[i]) end
+        end
+        if obj:IsA("MeshPart") then
+            tryProperty(out, obj, "MeshId")
+            tryProperty(out, obj, "TextureID")
+        end
+        if obj:IsA("Decal") or obj:IsA("Texture") then
+            tryProperty(out, obj, "Texture")
+            tryProperty(out, obj, "Color3")
+            tryProperty(out, obj, "Transparency")
+        end
+        if obj:IsA("LocalScript") or obj:IsA("ModuleScript") or obj:IsA("Script") then
+            tryProperty(out, obj, "Disabled")
+            tryProperty(out, obj, "RunContext")
+        end
+        return out
     end
 
-    local function addMessage(role, text)
-        if not messages then return end
-        text = sanitizeUtf8String(text)
-        local displayLimit = tonumber(cfg("MaxChatDisplayLength", 0)) or 0
-        if displayLimit > 0 and #text > displayLimit then
-            text = text:sub(1, displayLimit) .. "\n...[display truncated " .. tostring(#text - displayLimit) .. " chars]"
-        end
-
-        local holder = Instance.new("Frame")
-        holder.BackgroundTransparency = 1
-        holder.Size = UDim2.new(1, -10, 0, 1)
-        holder.AutomaticSize = Enum.AutomaticSize.Y
-        holder.Parent = messages
-
-        local layout = Instance.new("UIListLayout")
-        layout.FillDirection = Enum.FillDirection.Vertical
-        layout.SortOrder = Enum.SortOrder.LayoutOrder
-        layout.Padding = UDim.new(0, 2)
-        layout.Parent = holder
-
-        -- Message header: role on the left, copy actions on the right.
-        local header = Instance.new("Frame")
-        header.BackgroundTransparency = 1
-        header.Size = UDim2.new(1, 0, 0, 20)
-        header.LayoutOrder = 1
-        header.Parent = holder
-
-        local roleLabel = Instance.new("TextLabel")
-        roleLabel.BackgroundTransparency = 1
-        roleLabel.Font = Enum.Font.SourceSansBold
-        roleLabel.TextSize = 13
-        roleLabel.TextXAlignment = Enum.TextXAlignment.Left
-        roleLabel.TextYAlignment = Enum.TextYAlignment.Center
-        roleLabel.TextColor3 = role == "You" and Color3.fromRGB(125, 190, 255) or Color3.fromRGB(130, 225, 160)
-        roleLabel.Text = role
-        roleLabel.Size = UDim2.new(1, -150, 1, 0)
-        roleLabel.Position = UDim2.new(0, 0, 0, 0)
-        roleLabel.Parent = header
-
-        local actions = Instance.new("Frame")
-        actions.BackgroundTransparency = 1
-        actions.AnchorPoint = Vector2.new(1, 0)
-        actions.Position = UDim2.new(1, 0, 0, 0)
-        actions.Size = UDim2.new(0, 146, 0, 18)
-        actions.Parent = header
-
-        local actionLayout = Instance.new("UIListLayout")
-        actionLayout.FillDirection = Enum.FillDirection.Horizontal
-        actionLayout.HorizontalAlignment = Enum.HorizontalAlignment.Right
-        actionLayout.VerticalAlignment = Enum.VerticalAlignment.Center
-        actionLayout.Padding = UDim.new(0, 5)
-        actionLayout.SortOrder = Enum.SortOrder.LayoutOrder
-        actionLayout.Parent = actions
-
-        local codeBlocks = extractCodeBlocks(text)
-        if #codeBlocks > 0 then
-            local copyCode = makeMessageActionButton(actions, "Copy Code", 1)
-            copyCode.MouseButton1Click:Connect(function()
-                copyText(table.concat(codeBlocks, "\n\n"), copyCode, #codeBlocks > 1 and ("Copied " .. #codeBlocks .. " code blocks") or "Copied code")
-            end)
-        end
-
-        local copyAll = makeMessageActionButton(actions, "Copy", 2)
-        copyAll.MouseButton1Click:Connect(function()
-            copyText(text, copyAll, role == "You" and "Copied message" or "Copied answer")
-        end)
-
-        local chunks = splitDisplayText(text, tonumber(cfg("ChatRenderChunkChars", 3500)) or 3500)
-        for i = 1, #chunks do
-            local body = Instance.new("TextLabel")
-            body.BackgroundTransparency = 1
-            body.Font = Enum.Font.Code
-            body.TextSize = 13
-            body.TextWrapped = true
-            body.RichText = false
-            body.TextXAlignment = Enum.TextXAlignment.Left
-            body.TextYAlignment = Enum.TextYAlignment.Top
-            body.TextColor3 = Settings.Theme.Text
-            body.Text = chunks[i]
-            body.Size = UDim2.new(1, 0, 0, 1)
-            body.AutomaticSize = Enum.AutomaticSize.Y
-            body.LayoutOrder = i + 1
-            body.Parent = holder
-        end
-
-        scrollMessagesToBottom()
-    end
-
-    local function addChoiceButtons(choices)
-        if not messages or type(choices) ~= "table" or #choices == 0 then return end
-        local holder = Instance.new("Frame")
-        holder.BackgroundTransparency = 1
-        holder.Size = UDim2.new(1, -10, 0, 28)
-        holder.AutomaticSize = Enum.AutomaticSize.Y
-        holder.Parent = messages
-
-        local layout = Instance.new("UIListLayout", holder)
-        layout.FillDirection = Enum.FillDirection.Horizontal
-        layout.Padding = UDim.new(0, 6)
-        layout.Wraps = true
-
-        for i = 1, math.min(#choices, 4) do
-            local choice = sanitizeString(choices[i], 180)
-            local b = Instance.new("TextButton")
-            b.AutoButtonColor = false
-            b.BackgroundColor3 = Settings.Theme.Button
-            b.BorderSizePixel = 0
-            b.Font = Enum.Font.SourceSans
-            b.TextSize = 12
-            b.TextColor3 = Settings.Theme.Text
-            b.Text = choice
-            b.AutomaticSize = Enum.AutomaticSize.X
-            b.Size = UDim2.new(0, 120, 0, 26)
-            b.Parent = holder
-            local pad = Instance.new("UIPadding", b)
-            pad.PaddingLeft = UDim.new(0, 10)
-            pad.PaddingRight = UDim.new(0, 10)
-            local corner = Instance.new("UICorner", b)
-            corner.CornerRadius = UDim.new(0, 5)
-            b.MouseEnter:Connect(function() b.BackgroundColor3 = Settings.Theme.ButtonHover end)
-            b.MouseLeave:Connect(function() b.BackgroundColor3 = Settings.Theme.Button end)
-            b.MouseButton1Click:Connect(function()
-                if inputBox then
-                    inputBox.Text = choice
-                    inputBox:CaptureFocus()
-                    inputBox.CursorPosition = #inputBox.Text + 1
-                end
-            end)
-        end
-
-        task.defer(function()
-            messages.CanvasPosition = Vector2.new(0, math.max(0, messages.AbsoluteCanvasSize.Y))
-        end)
-    end
-
-    local function updateProviderVisuals()
-        if claudeProviderButton then
-            claudeProviderButton.Text = "Claude Code"
-            claudeProviderButton.BackgroundColor3 = Settings.Theme.ListSelection
-            claudeProviderButton.Active = false
-            claudeProviderButton.AutoButtonColor = false
-        end
-        if inputBox then
-            inputBox.PlaceholderText = "Hỏi về game... Claude sẽ tự nghiên cứu Explorer • Ctrl+Enter gửi"
-        end
-        if sendButton then sendButton.Text = "Send" end
-        if newThreadButton then newThreadButton.Text = "New Session" end
-        if window then window:SetTitle("AI Assistant - Claude Code | make by hongson") end
-    end
-
-    function ClaudeCode.Ask(message)
-        message = normalizePrompt(message)
-        if message == "" then return end
-        if busy then
-            addMessage("Claude Code", "A request is already running.")
-            return
-        end
-
-        busy = true
-        if sendButton then
-            sendButton.Text = "..."
-            sendButton.Active = false
-        end
-
-        addMessage("You", message)
-
-        -- Auto Research mode: the user should not need to manually select objects or press
-        -- Sync before asking a question. Every request receives a fresh hierarchy/property
-        -- mirror. Readable script sources are deep-synced on the first request, when the live
-        -- DataModel tree changed, or when the deep mirror ages out. Claude then researches
-        -- the mirror autonomously from disk using Grep/Read/Glob.
-        local now = os.time()
-        local treeChanged = liveRootsDirty == true
-        local autoResearch = cfg("AutoResearchExplorer", true) == true
-        local deepTtl = tonumber(cfg("DeepSnapshotTTL", 900)) or 900
-        local deepNeeded = false
-
-        if autoResearch then
-            deepNeeded = (cfg("AutoDeepSyncOnFirstPrompt", true) == true and lastDeepSync == 0)
-                or (cfg("AutoDeepSyncWhenTreeChanges", true) == true and treeChanged)
-                or (lastDeepSync > 0 and (now - lastDeepSync) > deepTtl)
-
-            if deepNeeded then
-                setStatus("Auto Research: indexing Explorer + properties + script sources...", nil)
-                local deepOk, deepResult = ClaudeCode.SyncExplorerMirror(true, true)
-                if deepOk then
-                    hasFullSnapshot = true
-                    lastFullSync = now
-                    lastDeepSync = now
-                    lastMirroredRevision = liveRevision
-                    local instances = type(deepResult) == "table" and deepResult.instances or "?"
-                    local scripts = type(deepResult) == "table" and deepResult.scripts or "?"
-                    contextLabel.Text = string.format("Auto Research ready | Explorer %s objects | %s readable sources", tostring(instances), tostring(scripts))
-                else
-                    addMessage("Claude Code", "Auto Research deep-sync warning: " .. tostring(deepResult))
-                end
-            elseif cfg("AutoRefreshExplorerEveryPrompt", true) == true then
-                setStatus("Auto Research: refreshing live Explorer + properties...", nil)
-                local mirrorOk, mirrorResult = ClaudeCode.SyncExplorerMirror(false, true)
-                if mirrorOk then
-                    hasFullSnapshot = true
-                    lastFullSync = now
-                    lastMirroredRevision = liveRevision
-                    local instances = type(mirrorResult) == "table" and mirrorResult.instances or "?"
-                    contextLabel.Text = string.format("Auto Research refreshed | Explorer %s objects | source mirror cached", tostring(instances))
-                else
-                    addMessage("Claude Code", "Auto Research Explorer warning: " .. tostring(mirrorResult))
+    local function getAllReadableProperties(obj)
+        local out, used = {}, {}
+        local classData = API and API.Classes and API.Classes[obj.ClassName]
+        while classData do
+            local properties = classData.Properties or {}
+            for i = 1, #properties do
+                local prop = properties[i]
+                local name = prop.Name
+                if name and name ~= "Source" and not used[name] then
+                    used[name] = true
+                    local ok, value = pcall(function() return obj[name] end)
+                    if ok then out[name] = serializeValue(value) end
                 end
             end
-        elseif cfg("AutoMirrorBeforeClaudeChat", true) == true then
-            local ttl = tonumber(cfg("FullSnapshotTTL", 300)) or 300
-            if lastFullSync == 0 or (now - lastFullSync) > ttl then
-                setStatus("Refreshing Dex Explorer mirror...", nil)
-                local mirrorOk, mirrorResult = ClaudeCode.SyncExplorerMirror(false, true)
-                if mirrorOk then
-                    hasFullSnapshot = true
-                    lastFullSync = now
-                    lastMirroredRevision = liveRevision
-                else
-                    addMessage("Claude Code", "Explorer mirror warning: " .. tostring(mirrorResult))
+            classData = classData.Superclass
+        end
+        return out
+    end
+
+    local function getProperties(obj, mode, guiRelated)
+        if mode == "deep" or guiRelated then
+            return getAllReadableProperties(obj)
+        end
+        return getSmartProperties(obj)
+    end
+
+    local function isScriptObject(obj)
+        return obj:IsA("LocalScript") or obj:IsA("ModuleScript") or obj:IsA("Script")
+    end
+
+    local function readSource(obj)
+        local cached = sourceCache[obj]
+        if cached then return cached.source, cached.error end
+        if not env.decompile or not env.isViableDecompileScript or not env.isViableDecompileScript(obj) then
+            local err = "source unavailable in current runtime"
+            sourceCache[obj] = {error = err}
+            return nil, err
+        end
+        local ok, source = pcall(env.decompile, obj)
+        if not ok or type(source) ~= "string" then
+            local err = ok and "decompiler returned no source" or tostring(source)
+            sourceCache[obj] = {error = err}
+            return nil, err
+        end
+        source = sanitizeUtf8(source)
+        sourceCache[obj] = {source = source}
+        return source
+    end
+
+    local function collectObjects(includeNil)
+        local objects = {game}
+        local descendants = game:GetDescendants()
+        for i = 1, #descendants do objects[#objects + 1] = descendants[i] end
+        if includeNil and env.getnilinstances then
+            local ok, nils = pcall(env.getnilinstances)
+            if ok and type(nils) == "table" then
+                local seen = setmetatable({}, {__mode = "k"})
+                for i = 1, #objects do seen[objects[i]] = true end
+                for i = 1, #nils do
+                    local obj = nils[i]
+                    if typeof(obj) == "Instance" and not seen[obj] then
+                        objects[#objects + 1] = obj
+                        seen[obj] = true
+                    end
                 end
             end
         end
-
-        -- Selection is only a hint. Claude is explicitly instructed to research the whole
-        -- accessible Explorer when needed and must not treat the current selection as scope.
-        setStatus("Syncing optional selection hint...", nil)
-        local selection = ClaudeCode.BuildSelectionContext(false, false)
-        local selectionHint = {}
-        for i = 1, math.min(selection.selectedCount or 0, 8) do
-            local item = selection.selected[i]
-            selectionHint[#selectionHint + 1] = {
-                path = item.path,
-                name = item.name,
-                className = item.className,
-                childCount = item.childCount,
-                isScript = item.isScript,
-            }
-        end
-
-        local syncOk, syncErr = syncPayload("selection", selection)
-        if not syncOk then
-            addMessage("Claude Code", "Selection hint warning: " .. tostring(syncErr))
-        end
-
-        setStatus("Claude is researching Roblox Explorer...", nil)
-        local ok, result = requestBridge("/chat", "POST", {
-            message = message,
-            placeId = game.PlaceId,
-            jobId = game.JobId,
-            autoResearch = autoResearch,
-            explorerRevision = liveRevision,
-            treeChanged = treeChanged,
-            deepSynced = deepNeeded,
-            selectedCount = selection.selectedCount,
-            selectionHint = selectionHint,
-        })
-
-        if ok then
-            local answer = type(result) == "table" and (result.answer or result.text or result.response) or tostring(result)
-            addMessage("Claude Code", answer or "(empty response)")
-            if type(result) == "table" and type(result.choices) == "table" then
-                addChoiceButtons(result.choices)
-            end
-            if type(result) == "table" and result.workspace then
-                contextLabel.Text = "Auto Research | Claude workspace: " .. sanitizeString(result.workspace, 180)
-            end
-            setStatus("Ready / Explorer research complete", true)
-        else
-            addMessage("Claude Code", "Bridge/Claude Code error: " .. tostring(result))
-            setStatus("Request failed", false)
-        end
-
-        busy = false
-        if sendButton then
-            sendButton.Text = "Send"
-            sendButton.Active = true
-        end
+        return objects
     end
 
-    function ClaudeCode.StartupResearch()
-        if startupResearchDone then return true, "already researched" end
-        if busy or startupResearchRunning then return false, "busy" end
-
-        startupResearchRunning = true
-        busy = true
-        if sendButton then
-            sendButton.Text = "..."
-            sendButton.Active = false
-        end
-
-        setStatus("Startup Research: reading complete Roblox Explorer...", nil)
-        local deepOk, deepResult = ClaudeCode.SyncExplorerMirror(true, true)
-        if not deepOk then
-            addMessage("Claude Code", "Startup Explorer research could not mirror the game: " .. tostring(deepResult))
-            setStatus("Startup Explorer mirror failed", false)
-            busy = false
-            startupResearchRunning = false
-            if sendButton then sendButton.Text = "Send" sendButton.Active = true end
-            return false, deepResult
-        end
-
-        local now = os.time()
-        hasFullSnapshot = true
-        lastFullSync = now
-        lastDeepSync = now
-        lastMirroredRevision = liveRevision
-        startupResearchDone = true
-
-        local instances = type(deepResult) == "table" and tonumber(deepResult.instances) or 0
-        local scripts = type(deepResult) == "table" and tonumber(deepResult.scripts) or 0
-        local scriptObjects = type(deepResult) == "table" and tonumber(deepResult.scriptObjects) or 0
-        contextLabel.Text = string.format(
-            "Explorer indexed: %d objects | readable sources %d/%d | Claude studying...",
-            instances or 0,
-            scripts or 0,
-            scriptObjects or 0
-        )
-
-        local selection = ClaudeCode.BuildSelectionContext(false, false)
-        syncPayload("selection", selection)
-
-        setStatus("Startup Research: Claude is building a Roblox architecture map...", nil)
-        local ok, result = requestBridge("/research", "POST", {
-            reason = "startup",
-            placeId = game.PlaceId,
-            jobId = game.JobId,
-            explorerRevision = liveRevision,
-            instances = instances,
-            scripts = scripts,
-            scriptObjects = scriptObjects,
-        })
-
-        if ok then
-            local answer = type(result) == "table" and (result.answer or result.summary or result.text) or tostring(result)
-            if answer and answer ~= "" then
-                addMessage("Claude Code", answer)
-            else
-                addMessage("Claude Code", "Startup Research complete. Claude has indexed and studied the accessible Roblox Explorer.")
-            end
-            local report = type(result) == "table" and result.report or nil
-            contextLabel.Text = report and ("Research ready: " .. sanitizeString(report, 160)) or "Research ready | full Explorer context indexed"
-            setStatus("Claude finished studying the Roblox Explorer", true)
-        else
-            addMessage("Claude Code", "Explorer mirror is ready, but the autonomous research pass failed: " .. tostring(result))
-            setStatus("Explorer indexed; Claude research pass failed", false)
-        end
-
-        busy = false
-        startupResearchRunning = false
-        if sendButton then
-            sendButton.Text = "Send"
-            sendButton.Active = true
-        end
-        return ok, result
+    local function buildRecord(obj, mode)
+        local guiRelated = isGuiRelated(obj)
+        local isScript = isScriptObject(obj)
+        local parentPath = nil
+        if obj.Parent then parentPath = buildPath(obj.Parent) end
+        return {
+            path = buildPath(obj),
+            parentPath = parentPath,
+            name = sanitizeString(obj.Name, 512),
+            className = obj.ClassName,
+            service = topServiceName(obj),
+            depth = depthOf(obj),
+            isGui = guiRelated,
+            isScript = isScript,
+            attributes = getAttributes(obj),
+            tags = mode == "deep" and getTags(obj) or nil,
+            properties = getProperties(obj, mode, guiRelated),
+        }
     end
 
-    local function RefreshChangedExplorerInBackground()
-        if busy or startupResearchRunning or not startupResearchDone then return false, "busy" end
-        if cfg("AutoMirrorExplorerChanges", true) ~= true then return false, "disabled" end
-        if liveRevision == lastMirroredRevision then return true, "unchanged" end
-
-        busy = true
-        setStatus("Explorer changed; updating Claude index...", nil)
-        local ok, result = ClaudeCode.SyncExplorerMirror(false, true)
-        if ok then
-            hasFullSnapshot = true
-            lastFullSync = os.time()
-            lastMirroredRevision = liveRevision
-            local instances = type(result) == "table" and result.instances or "?"
-            contextLabel.Text = string.format("Explorer auto-updated: %s objects | source research cache retained", tostring(instances))
-            setStatus("Claude Explorer index refreshed", true)
-        else
-            setStatus("Explorer auto-refresh failed", false)
-        end
-        busy = false
-        return ok, result
-    end
-
-    function ClaudeCode.Health()
+    function Exporter.Health()
         local ok, result = requestBridge("/health", "GET")
         if ok then
-            local ready = type(result) == "table" and result.ready
-            local workspace = type(result) == "table" and result.workspace or nil
-            local projectRoot = type(result) == "table" and result.projectRoot or nil
-            local roots = type(result) == "table" and result.roots or nil
-            local endpoint = type(result) == "table" and result.endpoint or nil
-            if ready == false then
-                setStatus("Bridge online; Claude Code CLI not found", false)
+            setStatus("DexBridge connected", true)
+            if type(result) == "table" then
+                local sources = result.includeScriptSources and "source ON" or "source OFF"
+                setDetail(tostring(result.exportRoot or "") .. " | " .. sources)
+            end
+            return true, result
+        end
+        setStatus("DexBridge offline", false)
+        setDetail("Run Start-DexBridge.bat first. " .. tostring(result))
+        return false, result
+    end
+
+    function Exporter.Export(options)
+        if busy then return false, "export already running" end
+        if not env.request then return false, "executor has no HTTP request function" end
+
+        options = type(options) == "table" and options or {}
+        local mode = tostring(options.mode or "balanced"):lower()
+        if mode ~= "deep" then mode = "balanced" end
+        local includeNil = options.includeNil
+        if includeNil == nil then includeNil = cfg("IncludeNilInstances", true) == true end
+
+        busy = true
+        if exportButton then exportButton.Active = false exportButton.Text = "Converting..." end
+        if deepButton then deepButton.Active = false end
+        if testButton then testButton.Active = false end
+        setProgress(0, 1, "Scanning Roblox Explorer...")
+        setDetail("Building client-visible DataModel list")
+
+        local started = os.clock()
+        table.clear(pathCache)
+        table.clear(sourceCache)
+
+        local healthOk, health = requestBridge("/health", "GET")
+        if not healthOk then
+            busy = false
+            if exportButton then exportButton.Active = true exportButton.Text = "Export to Bridge" end
+            if deepButton then deepButton.Active = true end
+            if testButton then testButton.Active = true end
+            setStatus("DexBridge offline", false)
+            setDetail("Run Start-DexBridge.bat first. " .. tostring(health))
+            return false, health
+        end
+
+        local objects = collectObjects(includeNil)
+        local gameName = "Place_" .. tostring(game.PlaceId)
+        pcall(function() gameName = service.MarketplaceService:GetProductInfo(game.PlaceId).Name end)
+        local requestedSources = type(health) == "table" and health.includeScriptSources == true
+        local chunkSize = tonumber(type(health) == "table" and health.chunkSize) or tonumber(cfg("ChunkSize", 300)) or 300
+        chunkSize = math.clamp(math.floor(chunkSize), 20, 600)
+
+        local beginOk, beginResult = requestBridge("/export/begin", "POST", {
+            placeId = game.PlaceId,
+            jobId = game.JobId,
+            gameName = gameName,
+            total = #objects,
+            mode = mode,
+            includeSources = requestedSources,
+            client = {
+                dexVersion = Exporter.Version,
+                executor = tostring(env.executor or "unknown"),
+            },
+        })
+        if not beginOk or type(beginResult) ~= "table" or not beginResult.sessionId then
+            busy = false
+            if exportButton then exportButton.Active = true exportButton.Text = "Export to Bridge" end
+            if deepButton then deepButton.Active = true end
+            if testButton then testButton.Active = true end
+            setStatus("Could not start bridge export", false)
+            setDetail(tostring(beginResult))
+            return false, beginResult
+        end
+
+        local sessionId = tostring(beginResult.sessionId)
+        local includeSources = beginResult.includeScriptSources == true
+        local records = {}
+        local scripts = {}
+        local recordFailures = 0
+        local sent = 0
+        local uiCount = 0
+        local yieldEvery = math.max(20, tonumber(cfg("YieldEvery", 250)) or 250)
+
+        local function flushRecords(processed)
+            if #records == 0 then return true end
+            local payloadRecords = records
+            records = {}
+            local ok, result = requestBridge("/export/chunk", "POST", {
+                sessionId = sessionId,
+                processed = processed,
+                total = #objects,
+                stage = mode == "deep" and "Deep-converting Explorer" or "Converting Explorer + full UI",
+                records = payloadRecords,
+            })
+            if not ok then return false, result end
+            sent = processed
+            return true
+        end
+
+        for i = 1, #objects do
+            local obj = objects[i]
+            local okRecord, record = pcall(buildRecord, obj, mode)
+            if okRecord and type(record) == "table" then
+                records[#records + 1] = record
+                if record.isGui then uiCount += 1 end
+                if record.isScript then scripts[#scripts + 1] = obj end
             else
-                setStatus("Bridge online / Claude Code ready", true)
+                recordFailures += 1
             end
-            if contextLabel and workspace then
-                local endpointText = endpoint and endpoint ~= "default" and (" | endpoint: " .. tostring(endpoint)) or ""
-                local rootCount = type(roots) == "table" and #roots or 1
-                local projectText = projectRoot and sanitizeString(projectRoot, 110) or sanitizeString(workspace, 110)
-                contextLabel.Text = "Project: " .. projectText .. " | roots: " .. tostring(rootCount) .. endpointText
+
+            if #records >= chunkSize or i == #objects then
+                local flushOk, flushErr = flushRecords(i)
+                if not flushOk then
+                    busy = false
+                    if exportButton then exportButton.Active = true exportButton.Text = "Export to Bridge" end
+                    if deepButton then deepButton.Active = true end
+                    if testButton then testButton.Active = true end
+                    setStatus("Bridge transfer failed", false)
+                    setDetail(tostring(flushErr))
+                    return false, flushErr
+                end
             end
-        else
-            setStatus("Bridge offline: " .. tostring(result), false)
+
+            if i == 1 or i % yieldEvery == 0 or i == #objects then
+                setProgress(i, #objects, mode == "deep" and "Deep-converting Explorer..." or "Converting Explorer + UI...")
+                setDetail(string.format("%d / %d | UI %d | Scripts %d | chunk %d", i, #objects, uiCount, #scripts, chunkSize))
+                task.wait()
+            end
         end
-        return ok, result
+
+        local sourceExported = 0
+        local sourceFailures = 0
+        if includeSources and #scripts > 0 then
+            setStatus("Exporting readable script source...", nil)
+            for i = 1, #scripts do
+                local obj = scripts[i]
+                local source, sourceErr = readSource(obj)
+                if source then
+                    local okSource = requestBridge("/export/source", "POST", {
+                        sessionId = sessionId,
+                        index = i,
+                        path = buildPath(obj),
+                        name = sanitizeString(obj.Name, 512),
+                        className = obj.ClassName,
+                        source = source,
+                        stage = string.format("Exporting readable scripts %d/%d", i, #scripts),
+                    })
+                    if okSource then sourceExported += 1 else sourceFailures += 1 end
+                else
+                    sourceFailures += 1
+                end
+                if i == 1 or i % 10 == 0 or i == #scripts then
+                    setProgress(#objects, #objects, string.format("Scripts %d/%d", i, #scripts))
+                    setDetail(string.format("Readable source %d | unavailable %d", sourceExported, sourceFailures))
+                    task.wait()
+                end
+            end
+        end
+
+        local finishOk, finishResult = requestBridge("/export/finish", "POST", {
+            sessionId = sessionId,
+            processed = #objects,
+            total = #objects,
+            failures = recordFailures + sourceFailures,
+            uiCount = uiCount,
+            scriptCount = #scripts,
+            sourceCount = sourceExported,
+            seconds = os.clock() - started,
+        })
+
+        busy = false
+        if exportButton then exportButton.Active = true exportButton.Text = "Export to Bridge" end
+        if deepButton then deepButton.Active = true end
+        if testButton then testButton.Active = true end
+
+        if not finishOk then
+            setStatus("Export converted, finalize failed", false)
+            setDetail(tostring(finishResult))
+            return false, finishResult
+        end
+
+        Exporter.LastResult = finishResult
+        setProgress(#objects, #objects, "Export complete")
+        setStatus("100% — Export complete", true)
+        if type(finishResult) == "table" then
+            setDetail(string.format("%d instances | %d UI | folder: %s", #objects, uiCount, tostring(finishResult.folder or beginResult.folder or "")))
+        else
+            setDetail(tostring(beginResult.folder or ""))
+        end
+        return true, finishResult
     end
 
-    function ClaudeCode.NewThread()
-        local ok, result = requestBridge("/new-thread", "POST", {})
-        if ok then
-            addMessage("Claude Code", "Started a new Claude Code session. The local Dex workspace is preserved.")
-            setStatus("New Claude session ready", true)
-        else
-            addMessage("Claude Code", "Could not start a new session: " .. tostring(result))
-            setStatus("New session failed", false)
-        end
-        return ok, result
-    end
-
-    function ClaudeCode.OpenClaude()
-        local ok, result = requestBridge("/open", "POST", {})
-        if ok then
-            addMessage("Claude Code", "Opened Claude Code at the configured project root with all configured context roots.")
-            setStatus("Claude Code terminal opened", true)
-        else
-            addMessage("Claude Code", "Could not open Claude Code: " .. tostring(result))
-            setStatus("Open Claude Code failed", false)
-        end
-        return ok, result
-    end
-
-    function ClaudeCode.OpenWorkspace()
-        local ok, result = requestBridge("/workspace/open", "POST", {})
-        if ok then
-            setStatus("Workspace opened", true)
-        else
-            addMessage("Claude Code", "Could not open workspace: " .. tostring(result))
-            setStatus("Open workspace failed", false)
-        end
-        return ok, result
-    end
-
-    local function makeButton(parent, text, x, width, y, height)
+    local function makeButton(parent, text, x, width)
         local button = Instance.new("TextButton")
         button.AutoButtonColor = false
         button.BackgroundColor3 = Settings.Theme.Button
@@ -15757,279 +14736,131 @@ local function main()
         button.TextSize = 13
         button.TextColor3 = Settings.Theme.Text
         button.Text = text
-        button.Position = UDim2.new(0, x, 0, y or 0)
-        button.Size = UDim2.new(0, width, 0, height or 24)
+        button.Position = UDim2.new(0, x, 0, 0)
+        button.Size = UDim2.new(0, width, 0, 30)
         button.Parent = parent
-        local corner = Instance.new("UICorner")
-        corner.CornerRadius = UDim.new(0, 4)
-        corner.Parent = button
-        button.MouseEnter:Connect(function() button.BackgroundColor3 = Settings.Theme.ButtonHover end)
-        button.MouseLeave:Connect(function()
-            if button == claudeProviderButton then
-                button.BackgroundColor3 = Settings.Theme.ListSelection
-            else
-                button.BackgroundColor3 = Settings.Theme.Button
-            end
-        end)
+        local corner = Instance.new("UICorner", button)
+        corner.CornerRadius = UDim.new(0, 6)
+        button.MouseEnter:Connect(function() if button.Active then button.BackgroundColor3 = Settings.Theme.ButtonHover end end)
+        button.MouseLeave:Connect(function() button.BackgroundColor3 = Settings.Theme.Button end)
         return button
     end
 
-    ClaudeCode.Init = function()
+    Exporter.Init = function()
         window = Lib.Window.new()
-        window:SetTitle("AI Assistant")
-        window:Resize(640, 520)
-        ClaudeCode.Window = window
+        window:SetTitle("DexBridge Export | make by hongson")
+        window:Resize(560, 300)
+        Exporter.Window = window
 
         local content = window.GuiElems.Content
 
-        local top = Instance.new("Frame")
-        top.BackgroundColor3 = Settings.Theme.Main2
-        top.BorderSizePixel = 0
-        top.Position = UDim2.new(0, 6, 0, 7)
-        top.Size = UDim2.new(1, -12, 0, 56)
-        top.Parent = content
-        local topCorner = Instance.new("UICorner", top)
-        topCorner.CornerRadius = UDim.new(0, 4)
+        local title = Instance.new("TextLabel")
+        title.BackgroundTransparency = 1
+        title.Font = Enum.Font.SourceSansBold
+        title.TextSize = 18
+        title.TextXAlignment = Enum.TextXAlignment.Left
+        title.TextColor3 = Settings.Theme.Text
+        title.Text = "DexBridge Explorer Converter"
+        title.Position = UDim2.new(0, 14, 0, 10)
+        title.Size = UDim2.new(1, -28, 0, 25)
+        title.Parent = content
 
-        claudeProviderButton = makeButton(top, "Claude Code", 4, 104, 3, 22)
-        claudeProviderButton.BackgroundColor3 = Settings.Theme.ListSelection
-        claudeProviderButton.Active = false
+        local subtitle = Instance.new("TextLabel")
+        subtitle.BackgroundTransparency = 1
+        subtitle.Font = Enum.Font.SourceSans
+        subtitle.TextSize = 13
+        subtitle.TextWrapped = true
+        subtitle.TextXAlignment = Enum.TextXAlignment.Left
+        subtitle.TextYAlignment = Enum.TextYAlignment.Top
+        subtitle.TextColor3 = Settings.Theme.PlaceholderText
+        subtitle.Text = "Exports the client-visible Explorer directly to the desktop DexBridge. UI objects always receive detailed API-readable properties."
+        subtitle.Position = UDim2.new(0, 14, 0, 40)
+        subtitle.Size = UDim2.new(1, -28, 0, 42)
+        subtitle.Parent = content
 
-        syncButton = makeButton(top, "Refresh", 4, 76, 30, 22)
-        deepSyncButton = makeButton(top, "Reindex All", 84, 84, 30, 22)
-        newThreadButton = makeButton(top, "New Session", 172, 90, 30, 22)
-        openClaudeButton = makeButton(top, "Open Claude", 266, 94, 30, 22)
-        openWorkspaceButton = makeButton(top, "Open Folder", 364, 88, 30, 22)
+        local buttons = Instance.new("Frame")
+        buttons.BackgroundTransparency = 1
+        buttons.Position = UDim2.new(0, 14, 0, 90)
+        buttons.Size = UDim2.new(1, -28, 0, 30)
+        buttons.Parent = content
+
+        exportButton = makeButton(buttons, "Export to Bridge", 0, 145)
+        deepButton = makeButton(buttons, "Deep Convert", 153, 120)
+        testButton = makeButton(buttons, "Test Bridge", 281, 105)
+
+        local barBack = Instance.new("Frame")
+        barBack.BackgroundColor3 = Color3.fromRGB(44, 48, 56)
+        barBack.BorderSizePixel = 0
+        barBack.Position = UDim2.new(0, 14, 0, 136)
+        barBack.Size = UDim2.new(1, -28, 0, 20)
+        barBack.Parent = content
+        local backCorner = Instance.new("UICorner", barBack)
+        backCorner.CornerRadius = UDim.new(0, 6)
+
+        progressFill = Instance.new("Frame")
+        progressFill.BackgroundColor3 = Color3.fromRGB(47, 129, 247)
+        progressFill.BorderSizePixel = 0
+        progressFill.Size = UDim2.new(0, 0, 1, 0)
+        progressFill.Parent = barBack
+        local fillCorner = Instance.new("UICorner", progressFill)
+        fillCorner.CornerRadius = UDim.new(0, 6)
+
+        progressText = Instance.new("TextLabel")
+        progressText.BackgroundTransparency = 1
+        progressText.Font = Enum.Font.SourceSansBold
+        progressText.TextSize = 12
+        progressText.TextColor3 = Color3.fromRGB(235, 240, 247)
+        progressText.Text = "0%"
+        progressText.Size = UDim2.new(1, 0, 1, 0)
+        progressText.ZIndex = 3
+        progressText.Parent = barBack
 
         statusLabel = Instance.new("TextLabel")
         statusLabel.BackgroundTransparency = 1
-        statusLabel.Font = Enum.Font.SourceSans
+        statusLabel.Font = Enum.Font.SourceSansBold
         statusLabel.TextSize = 13
-        statusLabel.TextXAlignment = Enum.TextXAlignment.Right
+        statusLabel.TextXAlignment = Enum.TextXAlignment.Left
         statusLabel.TextColor3 = Settings.Theme.Text
-        statusLabel.Text = "Checking bridge..."
-        statusLabel.Position = UDim2.new(0, 116, 0, 3)
-        statusLabel.Size = UDim2.new(1, -122, 0, 22)
-        statusLabel.Parent = top
+        statusLabel.Text = "Ready"
+        statusLabel.Position = UDim2.new(0, 14, 0, 170)
+        statusLabel.Size = UDim2.new(1, -28, 0, 22)
+        statusLabel.Parent = content
 
-        contextLabel = Instance.new("TextLabel")
-        contextLabel.BackgroundTransparency = 1
-        contextLabel.Font = Enum.Font.SourceSans
-        contextLabel.TextSize = 12
-        contextLabel.TextXAlignment = Enum.TextXAlignment.Left
-        contextLabel.TextColor3 = Settings.Theme.PlaceholderText
-        contextLabel.Text = "Auto Research | Claude reads Roblox Explorer + properties + scripts automatically"
-        contextLabel.Position = UDim2.new(0, 8, 0, 67)
-        contextLabel.Size = UDim2.new(1, -16, 0, 18)
-        contextLabel.Parent = content
+        detailLabel = Instance.new("TextLabel")
+        detailLabel.BackgroundTransparency = 1
+        detailLabel.Font = Enum.Font.Code
+        detailLabel.TextSize = 12
+        detailLabel.TextWrapped = true
+        detailLabel.TextXAlignment = Enum.TextXAlignment.Left
+        detailLabel.TextYAlignment = Enum.TextYAlignment.Top
+        detailLabel.TextColor3 = Settings.Theme.PlaceholderText
+        detailLabel.Text = "Run Start-DexBridge.bat on your PC, then click Test Bridge."
+        detailLabel.Position = UDim2.new(0, 14, 0, 198)
+        detailLabel.Size = UDim2.new(1, -28, 0, 62)
+        detailLabel.Parent = content
 
-        messages = Instance.new("ScrollingFrame")
-        messages.BackgroundColor3 = Settings.Theme.Syntax.Background
-        messages.BorderSizePixel = 0
-        messages.ScrollBarThickness = 6
-        messages.ScrollBarImageColor3 = Settings.Theme.Highlight
-        messages.AutomaticCanvasSize = Enum.AutomaticSize.Y
-        messages.CanvasSize = UDim2.new(0, 0, 0, 0)
-        messages.Position = UDim2.new(0, 6, 0, 88)
-        messages.Size = UDim2.new(1, -12, 1, -140)
-        messages.Parent = content
-        local msgCorner = Instance.new("UICorner", messages)
-        msgCorner.CornerRadius = UDim.new(0, 4)
-        local msgPadding = Instance.new("UIPadding", messages)
-        msgPadding.PaddingLeft = UDim.new(0, 8)
-        msgPadding.PaddingRight = UDim.new(0, 8)
-        msgPadding.PaddingTop = UDim.new(0, 8)
-        msgPadding.PaddingBottom = UDim.new(0, 8)
-        local msgLayout = Instance.new("UIListLayout", messages)
-        msgLayout.Padding = UDim.new(0, 10)
-        msgLayout.SortOrder = Enum.SortOrder.LayoutOrder
-
-        local inputFrame = Instance.new("Frame")
-        inputFrame.BackgroundColor3 = Settings.Theme.TextBox
-        inputFrame.BorderSizePixel = 0
-        inputFrame.Position = UDim2.new(0, 6, 1, -46)
-        inputFrame.Size = UDim2.new(1, -12, 0, 40)
-        inputFrame.Parent = content
-        local inputCorner = Instance.new("UICorner", inputFrame)
-        inputCorner.CornerRadius = UDim.new(0, 4)
-
-        inputBox = Instance.new("TextBox")
-        inputBox.BackgroundTransparency = 1
-        inputBox.ClearTextOnFocus = false
-        inputBox.MultiLine = true
-        inputBox.Font = Enum.Font.Code
-        inputBox.TextSize = 13
-        inputBox.TextColor3 = Settings.Theme.Text
-        inputBox.PlaceholderColor3 = Settings.Theme.PlaceholderText
-        inputBox.PlaceholderText = "Hỏi về game... Claude sẽ tự nghiên cứu Explorer • Ctrl+Enter gửi"
-        inputBox.TextXAlignment = Enum.TextXAlignment.Left
-        inputBox.TextYAlignment = Enum.TextYAlignment.Top
-        inputBox.TextWrapped = true
-        inputBox.Text = ""
-        inputBox.Position = UDim2.new(0, 8, 0, 4)
-        inputBox.Size = UDim2.new(1, -78, 1, -8)
-        inputBox.Parent = inputFrame
-
-        sendButton = Instance.new("TextButton")
-        sendButton.AutoButtonColor = false
-        sendButton.BackgroundColor3 = Settings.Theme.ListSelection
-        sendButton.BorderSizePixel = 0
-        sendButton.Font = Enum.Font.SourceSansBold
-        sendButton.TextSize = 13
-        sendButton.TextColor3 = Color3.new(1, 1, 1)
-        sendButton.Text = "Send"
-        sendButton.AnchorPoint = Vector2.new(1, 1)
-        sendButton.Position = UDim2.new(1, -6, 1, -6)
-        sendButton.Size = UDim2.new(0, 60, 0, 30)
-        sendButton.Parent = inputFrame
-        local sendCorner = Instance.new("UICorner", sendButton)
-        sendCorner.CornerRadius = UDim.new(0, 4)
-
-        local function updateComposerSize()
-            if not inputBox or not inputFrame or not messages then return end
-            local width = math.max(120, inputBox.AbsoluteSize.X)
-            local maxComposerHeight = tonumber(cfg("ComposerMaxHeight", 220)) or 220
-            local text = inputBox.Text ~= "" and inputBox.Text or " "
-            local needed = 40
-
-            -- GetTextSize over a pasted 100k+ prompt on every keystroke is expensive.
-            -- Once the draft is clearly large, the composer is already at max height;
-            -- keep the entire TextBox content but skip measuring the entire string.
-            if #text > (tonumber(cfg("ComposerMeasureCharLimit", 12000)) or 12000) then
-                needed = maxComposerHeight
-            else
-                local okBounds, bounds = pcall(service.TextService.GetTextSize, service.TextService, text .. "\n", inputBox.TextSize, inputBox.Font, Vector2.new(width, 10000))
-                needed = okBounds and math.ceil(bounds.Y + 18) or 40
-            end
-
-            composerHeight = math.clamp(needed, 40, maxComposerHeight)
-            inputFrame.Position = UDim2.new(0, 6, 1, -(composerHeight + 6))
-            inputFrame.Size = UDim2.new(1, -12, 0, composerHeight)
-            messages.Size = UDim2.new(1, -12, 1, -(100 + composerHeight))
-        end
-
-        inputBox:GetPropertyChangedSignal("Text"):Connect(updateComposerSize)
-        inputBox:GetPropertyChangedSignal("AbsoluteSize"):Connect(updateComposerSize)
-        task.defer(updateComposerSize)
-
-        -- Claude Code is the only provider in this edition.
-
-        local function submit(explicitText)
-            local message = normalizePrompt(explicitText ~= nil and explicitText or inputBox.Text)
-            if message == "" then return end
-            if busy then return end
-
-            submitSerial += 1
-            local mySerial = submitSerial
-            inputBox.Text = ""
-            task.defer(function()
-                if inputBox and inputBox.Parent and mySerial == submitSerial then
-                    inputBox:CaptureFocus()
-                end
-            end)
-            task.spawn(function() ClaudeCode.Ask(message) end)
-        end
-
-        sendButton.MouseButton1Click:Connect(function() submit() end)
-
-        -- Editor-style composer:
-        --   Enter       -> normal newline (handled natively by the MultiLine TextBox)
-        --   Ctrl+Enter  -> send without destroying multiline formatting
-        service.UserInputService.InputBegan:Connect(function(input, processed)
-            if not inputBox or not inputBox:IsFocused() then return end
-            if input.KeyCode ~= Enum.KeyCode.Return then return end
-
-            local ctrl = service.UserInputService:IsKeyDown(Enum.KeyCode.LeftControl)
-                or service.UserInputService:IsKeyDown(Enum.KeyCode.RightControl)
-            if not ctrl then
-                -- Do not consume Return: Roblox inserts the newline into the TextBox.
-                return
-            end
-
-            local message = inputBox.Text
-            inputBox:ReleaseFocus()
-            task.defer(function() submit(message) end)
+        exportButton.MouseButton1Click:Connect(function()
+            task.spawn(function() Exporter.Export({mode = "balanced"}) end)
+        end)
+        deepButton.MouseButton1Click:Connect(function()
+            task.spawn(function() Exporter.Export({mode = "deep"}) end)
+        end)
+        testButton.MouseButton1Click:Connect(function()
+            task.spawn(Exporter.Health)
         end)
 
-        -- Losing focus must never implicitly submit a long/multiline draft.
-        inputBox.FocusLost:Connect(function()
-            task.defer(updateComposerSize)
-        end)
-
-        syncButton.MouseButton1Click:Connect(function()
-            if busy then return end
-            task.spawn(function() ClaudeCode.SyncFull(false) end)
-        end)
-
-        deepSyncButton.MouseButton1Click:Connect(function()
-            if busy then return end
-            task.spawn(function() ClaudeCode.SyncFull(true) end)
-        end)
-
-        newThreadButton.MouseButton1Click:Connect(function()
-            if busy then return end
-            task.spawn(ClaudeCode.NewThread)
-        end)
-
-        openClaudeButton.MouseButton1Click:Connect(function()
-            if busy then return end
-            task.spawn(ClaudeCode.OpenClaude)
-        end)
-
-        openWorkspaceButton.MouseButton1Click:Connect(function()
-            if busy then return end
-            task.spawn(ClaudeCode.OpenWorkspace)
-        end)
-
-        if Explorer and Explorer.Selection and Explorer.Selection.Changed then
-            Explorer.Selection.Changed:Connect(function()
-                local count = #Explorer.Selection.List
-                contextLabel.Text = string.format("Auto Research enabled | selection %d object(s) is only an optional hint", count)
-            end)
-        end
-
-        addMessage("AI", "Dex++ Claude Code v5 Startup Research - make by hongson. You do not need to press Sync or ask Claude to read Explorer first. When the local bridge becomes ready, Dex++ automatically Deep Mirrors the accessible Roblox DataModel, readable properties and script sources, then Claude autonomously studies the game architecture. Selection is only an optional hint. Ctrl+Enter sends.")
-        updateProviderVisuals()
-
-        task.spawn(function()
-            while window and window.GuiElems and window.GuiElems.Main and window.GuiElems.Main.Parent and not startupResearchDone do
-                if not busy and cfg("AutoResearchOnStartup", true) == true then
-                    local healthOk, health = ClaudeCode.Health()
-                    if healthOk and type(health) == "table" and health.ready ~= false then
-                        task.wait(math.max(0, tonumber(cfg("StartupResearchDelay", 1.5)) or 1.5))
-                        if not busy and not startupResearchDone then
-                            ClaudeCode.StartupResearch()
-                        end
-                        break
-                    end
-                end
-                task.wait(3)
-            end
-        end)
-
-        task.spawn(function()
-            local interval = math.max(5, tonumber(cfg("AutoMirrorExplorerInterval", 20)) or 20)
-            while window and window.GuiElems and window.GuiElems.Main and window.GuiElems.Main.Parent do
-                task.wait(interval)
-                if startupResearchDone and not busy and liveRevision ~= lastMirroredRevision then
-                    RefreshChangedExplorerInBackground()
-                end
-            end
-        end)
-
-        task.spawn(function()
-            while window and window.GuiElems and window.GuiElems.Main and window.GuiElems.Main.Parent do
-                task.wait(3)
-                if not busy then ClaudeCode.Health() end
-            end
+        task.defer(function()
+            task.wait(0.25)
+            Exporter.Health()
         end)
     end
 
-    return ClaudeCode
+    return Exporter
 end
 
 return {InitDeps = initDeps, InitAfterMain = initAfterMain, Main = main}
 end,
+
 }
 local oldgame = oldgame or game
 
@@ -16069,7 +14900,7 @@ end
 local isFsSupported = readfile and writefile and isfile and isfolder and listfiles and delfile and delfolder
 
 -- Main vars
-local Main, Explorer, Properties, ScriptViewer, Console, SaveInstance, ModelViewer, SettingsWindow, ClaudeCode--[[, SecretServicePanel]], DefaultSettings, Notebook, Serializer, Lib local ggv = getgenv or nil
+local Main, Explorer, Properties, ScriptViewer, Console, SaveInstance, ModelViewer, SettingsWindow, Exporter--[[, SecretServicePanel]], DefaultSettings, Notebook, Serializer, Lib local ggv = getgenv or nil
 local API, RMD
 
 -- Default Settings
@@ -16148,39 +14979,13 @@ DefaultSettings = (function()
 		ScriptViewer = {
 			ShowMoreInfo = true;
 		},
-		ClaudeCode = {
+		Exporter = {
 			_Recurse = true,
-			BridgeUrl = "http://127.0.0.1:32187",
-			CompactContextMaxInstances = 2500,
-			CompactContextMaxScripts = 0, -- sources live in dex/scripts/*.luau after Deep Sync
-			MaxPropertiesPerInstance = 160,
-			MaxSelectedInstances = 20,
-			MaxChildrenInDetail = 300,
-			MaxSourceLength = 60000,
+			BridgeUrl = "http://127.0.0.1:32189",
+			ChunkSize = 300,
+			IncludeNilInstances = true,
 			MaxStringLength = 32768,
-			MaxChatMessageLength = 4194304, -- UI/bridge can carry very large multiline prompts
-			MaxChatDisplayLength = 0, -- 0 = no artificial display truncation; renderer chunks long messages
-			ChatRenderChunkChars = 3500,
-			ComposerMaxHeight = 220,
-			ComposerMeasureCharLimit = 12000, -- avoid measuring huge pasted prompts every keystroke
-			FullSnapshotTTL = 300,
-			MaxToolBatch = 8,
-			MaxToolPageSize = 500,
-			ToolSourceChunkBytes = 32000,
-			AutoResearchOnStartup = true, -- Deep Mirror + autonomous Claude study before the first user prompt
-			StartupResearchDelay = 1.5,
-			AutoMirrorExplorerChanges = true, -- refresh hierarchy/properties after live Explorer changes
-			AutoMirrorExplorerInterval = 20,
-			AutoResearchExplorer = true, -- every prompt continues researching the Roblox Explorer automatically
-			AutoRefreshExplorerEveryPrompt = true, -- refresh hierarchy + readable properties before every Claude request
-			AutoDeepSyncOnFirstPrompt = true, -- first request exports all readable script sources automatically
-			AutoDeepSyncWhenTreeChanges = true, -- refresh sources when objects/scripts are added or removed
-			DeepSnapshotTTL = 900, -- periodically refresh cached readable sources even if the tree is unchanged
-			AutoMirrorBeforeClaudeChat = true, -- legacy fallback when AutoResearchExplorer is disabled
-			MirrorChunkSize = 40,
-			MirrorSourceChunkBytes = 48000,
-			MirrorPropertiesPerInstance = 0, -- 0 = every readable API property; large strings can be paged live with get_property
-			MirrorIncludeNilInstances = true, -- include nil instances when the environment exposes them
+			YieldEvery = 250,
 		},
 		Window = {
 			TitleOnMiddle = false,
@@ -16242,7 +15047,7 @@ end
 Main = (function()
 	local Main = {}
 
-	Main.ModuleList = {"Explorer","Properties","ScriptViewer","Console","SaveInstance","ModelViewer","SettingsWindow","ClaudeCode"}
+	Main.ModuleList = {"Explorer","Properties","ScriptViewer","Console","SaveInstance","ModelViewer","SettingsWindow","Exporter"}
 	Main.Elevated = false
 	Main.AllowDraggableOnMobile = true
 	Main.MissingEnv = {}
@@ -16499,7 +15304,7 @@ Main = (function()
 		ModelViewer = Apps.ModelViewer
 		Notebook = Apps.Notebook
 		SettingsWindow = Apps.SettingsWindow
-		ClaudeCode = Apps.ClaudeCode
+		Exporter = Apps.Exporter
 		
 		
 		--SecretServicePanel = Apps.SecretServicePanel
@@ -16512,7 +15317,7 @@ Main = (function()
 			ModelViewer = ModelViewer,
 			Notebook = Notebook,
 			SettingsWindow = SettingsWindow,
-			ClaudeCode = ClaudeCode
+			Exporter = Exporter
 			--SecretServicePanel = SecretServicePanel,
 		}
 		
@@ -17549,7 +16354,7 @@ Main = (function()
 		
 		Main.CreateApp({Name = "Console", IconMap = Main.LargeIcons, Icon = "Executor", Window = Console.Window})
 
-		Main.CreateApp({Name = "AI Assistant", IconMap = Main.LargeIcons, Icon = "Script_Viewer", Window = ClaudeCode.Window})
+		Main.CreateApp({Name = "Explorer Export", IconMap = Main.LargeIcons, Icon = "Book", Window = Exporter.Window})
 		
 		Main.CreateApp({Name = "Save Instance", IconMap = Main.LargeIcons, Icon = "Book", Window = SaveInstance.Window})
 		
@@ -17684,7 +16489,7 @@ Main = (function()
 		SaveInstance.Init()
 		ModelViewer.Init()
 		SettingsWindow.Init()
-		ClaudeCode.Init()
+		Exporter.Init()
 		--SecretServicePanel.Init()
 		
 		
