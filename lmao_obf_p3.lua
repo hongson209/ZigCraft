@@ -1,31 +1,29 @@
 --[[
-    SON HUB v3
+    SON HUB v6
     Target snapshot: PlaceId 118635363908336
     UI: ZyronX UI Library
     make by hongson
 
-    Clean architecture:
-      Core
-      RuntimeIndex
-      PlayerState
-      QuestService
-      HotbarService
-      TargetService
-      TweenController
-      BringService
+    Architecture
+      Core / RuntimeIndex
+      PlayerState / QuestService / QuestCatalogService
+      HotbarService / TargetService
+      PlatformTransport
+      BringService / HitboxService / CombatService / MasteryService
+      StatsService
       InteractionService
-      CombatService
-      FarmService
-      LifeSkillService
-      ESPService
-      UI
+      FishingService / MiningQTEService / LifeSkillService
+      ProgressionController
+      ESPService / UI
 
-    Design rules:
-      - No print/warn/console spam.
-      - No guessed RemoteEvent / RemoteFunction argument calls.
-      - Large Explorer is indexed once and updated incrementally.
-      - One movement controller owns Tween/Noclip movement.
-      - Auto Farm can run fully automatic from live Level + Quest state.
+    Principles
+      - One progression owner controls movement/combat.
+      - Auto Farm uses a local moving platform instead of tweening HRP directly.
+      - Hitbox applies only to combat mobs, never players/dialogue NPCs.
+      - Bring only matching farm/quest mobs.
+      - No console logging spam.
+      - No guessed RemoteEvent/RemoteFunction contracts.
+      - Expensive scans are cached or run only when their feature is active.
 ]]
 
 -- ============================================================
@@ -41,6 +39,7 @@ end
 local Library = loadstring(game:HttpGetAsync("https://pastefy.app/YoX4PJmf/raw"))()
 
 local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TweenService = game:GetService("TweenService")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
@@ -52,10 +51,31 @@ local LocalPlayer = Players.LocalPlayer
 local Workspace = workspace
 
 local EXPECTED_PLACE_ID = 118635363908336
-local VERSION = "3.0.0"
+local VERSION = "6.1.0"
+
+local SON_ICON_URL = "https://cdn.discordapp.com/attachments/1522131539696160882/1544607843666231326/ChatGPT_Image_Jun_14_2026_10_34_47_PM.png?ex=6a991fa7&is=6a97ce27&hm=486693cbb9841a7bdd2743b8af49abd2238e80fc00ac3bd8e55c73857ef9fff6"
+local FALLBACK_ICON = "rbxassetid://82367817676382"
+
+-- Forward declarations for clean dependency order.
+local QuestService
+local QuestCatalogService
+local HotbarService
+local TargetService
+local InteractionService
+local PlatformTransport
+local BringService
+local HitboxService
+local CombatService
+local MasteryService
+local StatsService
+local FishingService
+local MiningQTEService
+local LifeSkillService
+local ProgressionController
+local ESPService
 
 -- ============================================================
--- Core
+-- Core state
 -- ============================================================
 
 local Core = {
@@ -66,68 +86,110 @@ local Core = {
 }
 
 local Config = {
-    -- Farm
-    AutoFarm = false,
-    FarmMode = "Smart Quest",
-    SelectedMob = "Nearest Hostile",
-    SelectedWeapon = "Auto",
-    AutoAttack = true,
-    AutoSkill = false,
-    AutoSkillDelay = 2.5,
-    AttackRate = 8,
-    BringMobs = false,
-    BringRadius = 90,
-    BringLimit = 10,
-    BringDistance = 4,
-    BringBosses = false,
-    AutoLootAfterFarm = true,
-
-    -- Combat
-    AutoAim = true,
-    AutoBoss = false,
-    AutoBlock = false,
-    BlockHealthPercent = 40,
-    CombatDistance = 7,
-    FarmHeight = 4,
-    FarmBack = 3,
-
-    -- Tween / movement
-    TweenEnabled = true,
-    TweenSpeed = 175,
-    ArrivalDistance = 7,
-    TweenNoclip = true,
-    SpeedOverride = false,
-    WalkSpeed = 24,
-    JumpOverride = false,
-    JumpPower = 55,
-    InfiniteJump = false,
-    Noclip = false,
-
-    -- Quest
+    -- Full progression
+    AutoProgress = false,
     AutoQuest = true,
     AutoAcceptRecommended = true,
     AutoTurnIn = true,
     AutoDialogue = true,
     AutoClaim = true,
 
-    -- Player / collection / lifeskill
+    -- Farm
+    FarmMode = "Smart Quest",
+    SelectedMob = "Nearest Hostile",
+    AutoAttack = true,
+    AttackRate = 8,
+
+    -- Moving platform
+    PlatformTransport = true,
+    PlatformSpeed = 185,
+    PlatformSize = 8,
+    PlatformTransparency = 0.82,
+    PlatformFarmHeight = 12,
+    PlatformNpcHeight = 3.5,
+    PlatformBackDistance = 4,
+    PlatformArrivalDistance = 5,
+    PlatformRetargetDistance = 10,
+    PlatformNoclip = true,
+
+    -- Bring + hitbox
+    BringMobs = true,
+    BringRadius = 110,
+    BringLimit = 10,
+    MobBelowFeet = 7,
+    BringSpread = 1.4,
+    BringBosses = false,
+
+    MobHitbox = true,
+    HitboxSize = 10,
+    HitboxTransparency = 0.62,
+    HitboxBosses = false,
+
+    -- Weapon / mastery
+    SelectedWeapon = "Auto",
+    AutoMastery = false,
+    MasteryMode = "Combat Skills",
+    MasteryInterval = 0.45,
+    MasteryReadyOnly = true,
+
+    -- Combat
+    AutoAim = true,
+    AutoBlock = false,
+    BlockHealthPercent = 40,
+
+    -- Stats
+    AutoStats = false,
+    StatBuild = "Auto Weapon",
+    StatSpendInterval = 0.25,
+
+    -- Collection / lifeskills
     AutoPickup = false,
     AutoChest = false,
     AutoWorldBossChest = false,
     AutoFruitChest = false,
     AutoQuestItems = false,
+
     AutoMining = false,
+    AutoMiningQTE = true,
+    MiningMode = "Quest Required",
+    SelectedOre = "Copper Ore",
+    MiningCriticalTolerance = 0.035,
+    MiningHoldTimeout = 5.0,
+    MiningRetryDelay = 0.55,
+    MiningAutoAim = true,
+
     AutoFarming = false,
+
     AutoFishing = false,
+    FishingSpotMode = "Saved Position",
+    FishingAutoReturn = true,
+    FishingRequireBait = false,
+    FishingBiteTimeout = 40,
+    FishingCooldown = 2.0,
+    FishingReelTolerance = 14,
+    FishingAutoCalibrate = true,
+    FishingHoldMovesRight = true,
+    FishingAutoShake = true,
+    FishingAutoSpamClick = true,
+    FishingAutoTimedRelease = true,
+    FishingReleaseThreshold = 0.92,
+
+    -- Movement / player
+    SpeedOverride = false,
+    WalkSpeed = 24,
+    JumpOverride = false,
+    JumpPower = 55,
+    InfiniteJump = false,
+    Noclip = false,
     AntiAFK = true,
 
     -- ESP
-    QuestTargetESP = true,
+    CurrentTargetESP = true,
     MobESP = false,
     BossESP = false,
     LootESP = false,
     ESPDistance = 1200,
-    QuestColor = Color3.fromRGB(95, 200, 255),
+    TargetColor = Color3.fromRGB(95, 200, 255),
     MobColor = Color3.fromRGB(255, 205, 80),
     BossColor = Color3.fromRGB(255, 75, 95),
     LootColor = Color3.fromRGB(115, 255, 145),
@@ -138,26 +200,74 @@ local Runtime = {
     Entities = setmetatable({}, {__mode = "k"}),
     DialogueNPCs = setmetatable({}, {__mode = "k"}),
     DialogueQuestNames = setmetatable({}, {__mode = "k"}),
+    Ores = setmetatable({}, {__mode = "k"}),
 
     IndexReady = false,
 
-    CurrentTween = nil,
-    CurrentTweenTarget = nil,
+    ProgressState = "IDLE",
+    ProgressDetail = "Waiting",
+    ProgressQuestKey = nil,
     CurrentTarget = nil,
-    CurrentTargetReason = nil,
+    CurrentWantedMob = nil,
+    FarmAnchorCFrame = nil,
 
+    LastInteraction = 0,
+    LastQuestChange = 0,
     LastAttack = 0,
-    LastSkill = 0,
-    LastWeaponEquip = 0,
-    LastWeaponTitle = nil,
-    LastFishingCast = 0,
+    LastBring = 0,
+    LastHitbox = 0,
+    LastMastery = 0,
+    LastStatsSpend = 0,
+
+    TransportPart = nil,
+    TransportTween = nil,
+    TransportWeld = nil,
+    TransportGoal = nil,
+    TransportMoving = false,
+
+    ExpandedHitboxes = setmetatable({}, {__mode = "k"}),
+
+    FishingState = "IDLE",
+    FishingStateSince = 0,
+    FishingSpotCFrame = nil,
+    FishingReason = "Disabled",
+    FishingHadReel = false,
+    FishingMouseHeld = false,
+    FishingKeyHeld = nil,
+    FishingLastCast = 0,
+    FishingRodCache = nil,
+    FishingRodCacheAt = 0,
+    FishingBaitCache = nil,
+    FishingBaitCacheAt = 0,
+    FishingLastShakeClick = 0,
+    FishingLastShakePosition = nil,
+    FishingLastSpamClick = 0,
+    FishingTimedReleaseDone = false,
+    FishingReelCalibrated = false,
+    FishingHoldDirection = 1,
+    FishingLastMoveCenter = nil,
+    FishingLastMoveVelocity = 0,
+
+    MiningLastQTE = 0,
+    MiningState = "IDLE",
+    MiningStateSince = 0,
+    MiningTarget = nil,
+    MiningMouseHeld = false,
+    MiningLastAttempt = 0,
+    MiningReleaseDone = false,
+    ProgressLifeSkill = nil,
+
+    ClaimButtons = setmetatable({}, {__mode = "k"}),
+
+    MasteryCursor = 0,
 
     BlockHeld = false,
 
-    WorkerState = "Idle",
-    WorkerDetail = "Waiting",
+    QuestCatalog = {},
+    QuestCatalogByName = {},
+    QuestToNPCs = {},
+
     LastLevel = nil,
-    LastQuestKey = nil,
 }
 
 local function connect(signal, callback)
@@ -209,7 +319,6 @@ end
 
 local function rootPart()
     local char = character()
-
     return char and (
         char:FindFirstChild("HumanoidRootPart")
         or char.PrimaryPart
@@ -249,13 +358,13 @@ end
 
 local function distanceTo(object)
     local ownRoot = rootPart()
-    local targetRoot = objectRoot(object)
+    local target = objectRoot(object)
 
-    if not ownRoot or not targetRoot then
+    if not ownRoot or not target then
         return math.huge
     end
 
-    return (ownRoot.Position - targetRoot.Position).Magnitude
+    return (ownRoot.Position - target.Position).Magnitude
 end
 
 local function isGuiVisible(guiObject)
@@ -275,12 +384,46 @@ local function isGuiVisible(guiObject)
     return not screen or screen.Enabled
 end
 
+local function isScriptTemplateDescendant(object)
+    local current = object and object.Parent
+    while current and current ~= game do
+        if current:IsA("LocalScript")
+            or current:IsA("ModuleScript")
+            or current:IsA("Script") then
+            return true
+        end
+        current = current.Parent
+    end
+
+    return false
+end
+
+local function isOnScreen(guiObject)
+    if not guiObject or not guiObject:IsA("GuiObject") or not isGuiVisible(guiObject) then
+        return false
+    end
+
+    local pos = guiObject.AbsolutePosition
+    local size = guiObject.AbsoluteSize
+    local camera = Workspace.CurrentCamera
+    local viewport = camera and camera.ViewportSize or Vector2.new(1920, 1080)
+
+    return size.X > 0
+        and size.Y > 0
+        and pos.X + size.X >= 0
+        and pos.Y + size.Y >= 0
+        and pos.X <= viewport.X
+        and pos.Y <= viewport.Y
+end
+
 local function textOf(object)
     if not object then
         return ""
     end
 
-    if object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox") then
+    if object:IsA("TextLabel")
+        or object:IsA("TextButton")
+        or object:IsA("TextBox") then
         return normalize(object.Text)
     end
 
@@ -288,25 +431,85 @@ local function textOf(object)
     return label and normalize(label.Text) or ""
 end
 
-local function findText(root, name)
-    if not root then
+local function pressKey(key, holdTime)
+    if not key or key == Enum.KeyCode.Unknown then
+        return false
+    end
+
+    holdTime = holdTime or 0.035
+
+    return pcall(function()
+        VirtualInputManager:SendKeyEvent(true, key, false, game)
+        task.wait(holdTime)
+        VirtualInputManager:SendKeyEvent(false, key, false, game)
+    end)
+end
+
+local function mouseClickAt(x, y)
+    return pcall(function()
+        VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 0)
+        task.wait(0.025)
+        VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 0)
+    end)
+end
+
+local function mouseClickCenter()
+    local camera = Workspace.CurrentCamera
+    local viewport = camera and camera.ViewportSize or Vector2.new(800, 600)
+    return mouseClickAt(viewport.X / 2, viewport.Y / 2)
+end
+
+local function mouseButtonAt(x, y, held)
+    return pcall(function()
+        VirtualInputManager:SendMouseButtonEvent(x, y, 0, held, game, 0)
+    end)
+end
+
+local function screenPointOf(object)
+    local camera = Workspace.CurrentCamera
+    local part = objectRoot(object)
+    if not camera or not part then
         return nil
     end
 
-    local object = root:FindFirstChild(name, true)
-    if object and (
-        object:IsA("TextLabel")
-        or object:IsA("TextButton")
-        or object:IsA("TextBox")
-    ) then
-        return object
+    local point, visible = camera:WorldToViewportPoint(part.Position)
+    if not visible or point.Z <= 0 then
+        return nil
     end
 
-    return nil
+    return Vector2.new(point.X, point.Y)
+end
+
+local function clickButton(button, allowHiddenSignal)
+    if not button or not button:IsA("GuiButton") then
+        return false
+    end
+
+    if type(firesignal) == "function" then
+        local ok = pcall(function()
+            firesignal(button.Activated)
+        end)
+
+        if ok then
+            return true
+        end
+    end
+
+    if allowHiddenSignal ~= true and not isGuiVisible(button) then
+        return false
+    end
+
+    if not isOnScreen(button) then
+        return false
+    end
+
+    local pos = button.AbsolutePosition
+    local size = button.AbsoluteSize
+    return mouseClickAt(pos.X + size.X / 2, pos.Y + size.Y / 2)
 end
 
 -- ============================================================
--- RuntimeIndex
+-- Runtime index
 -- ============================================================
 
 local RuntimeIndex = {}
@@ -334,6 +537,11 @@ function RuntimeIndex.Register(instance)
         return
     end
 
+    if instance:GetAttribute("ObjectType") == "Ore"
+        or instance:GetAttribute("Ore") ~= nil then
+        Runtime.Ores[instance] = true
+    end
+
     local entities = entitiesFolder()
     if entities and instance.Parent == entities then
         Runtime.Entities[instance] = true
@@ -353,15 +561,17 @@ function RuntimeIndex.Unregister(instance)
     Runtime.Entities[instance] = nil
     Runtime.DialogueNPCs[instance] = nil
     Runtime.DialogueQuestNames[instance] = nil
+    Runtime.Ores[instance] = nil
 end
 
 function RuntimeIndex.Rebuild()
+    Runtime.IndexReady = false
+
     table.clear(Runtime.Prompts)
     table.clear(Runtime.Entities)
     table.clear(Runtime.DialogueNPCs)
     table.clear(Runtime.DialogueQuestNames)
-
-    Runtime.IndexReady = false
+    table.clear(Runtime.Ores)
 
     local descendants = Workspace:GetDescendants()
 
@@ -382,7 +592,7 @@ connect(Workspace.DescendantRemoving, RuntimeIndex.Unregister)
 task.spawn(RuntimeIndex.Rebuild)
 
 -- ============================================================
--- PlayerState
+-- Player state
 -- ============================================================
 
 local PlayerState = {}
@@ -394,18 +604,24 @@ function PlayerState.GetLevel()
     end
 
     local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
-    if leaderstats then
-        local value = leaderstats:FindFirstChild("Level") or leaderstats:FindFirstChild("Lvl")
-        if value and (value:IsA("NumberValue") or value:IsA("IntValue")) then
-            return tonumber(value.Value) or 0
-        end
+    local value = leaderstats and (
+        leaderstats:FindFirstChild("Level")
+        or leaderstats:FindFirstChild("Lvl")
+    )
+
+    if value and (value:IsA("IntValue") or value:IsA("NumberValue")) then
+        return tonumber(value.Value) or 0
     end
 
     return 0
 end
 
 function PlayerState.GetWorld()
-    return tostring(LocalPlayer:GetAttribute("WorldType") or Workspace:GetAttribute("WorldType") or "Unknown")
+    return tostring(
+        LocalPlayer:GetAttribute("WorldType")
+        or Workspace:GetAttribute("WorldType")
+        or "Unknown"
+    )
 end
 
 function PlayerState.GetFruit()
@@ -416,18 +632,6 @@ function PlayerState.GetFruitLevel()
     return tonumber(LocalPlayer:GetAttribute("FruitLevel")) or 0
 end
 
-function PlayerState.GetBounty()
-    local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
-    local bounty = leaderstats and leaderstats:FindFirstChild("Bounty")
-    return bounty and tonumber(bounty.Value) or 0
-end
-
-function PlayerState.GetLeaderString(name)
-    local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
-    local value = leaderstats and leaderstats:FindFirstChild(name)
-    return value and tostring(value.Value) or ""
-end
-
 function PlayerState.GetEntity()
     local entities = entitiesFolder()
     return entities and entities:FindFirstChild(LocalPlayer.Name)
@@ -436,18 +640,18 @@ end
 function PlayerState.GetWeaponTypes()
     local entity = PlayerState.GetEntity()
     if not entity then
-        return "Unknown"
+        return {}
     end
 
-    local values = {}
+    local result = {}
     for index = 1, 3 do
         local value = entity:GetAttribute("WeaponType" .. index)
         if value and tostring(value) ~= "" then
-            table.insert(values, tostring(value))
+            table.insert(result, tostring(value))
         end
     end
 
-    return #values > 0 and table.concat(values, " / ") or "Unknown"
+    return result
 end
 
 function PlayerState.GetHealthPercent()
@@ -459,22 +663,31 @@ function PlayerState.GetHealthPercent()
     return math.clamp((hum.Health / hum.MaxHealth) * 100, 0, 100)
 end
 
+function PlayerState.GetLeaderValue(name)
+    local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
+    local value = leaderstats and leaderstats:FindFirstChild(name)
+    return value and value.Value or nil
+end
+
 function PlayerState.IsReady()
     local loaded = LocalPlayer:GetAttribute("Loaded")
     local playerLoaded = LocalPlayer:GetAttribute("PlayerLoaded")
 
     if loaded == nil and playerLoaded == nil then
-        return true
+        return humanoid() ~= nil and rootPart() ~= nil
     end
 
-    return loaded ~= false and playerLoaded ~= false
+    return loaded ~= false
+        and playerLoaded ~= false
+        and humanoid() ~= nil
+        and rootPart() ~= nil
 end
 
 -- ============================================================
--- QuestService
+-- Quest service
 -- ============================================================
 
-local QuestService = {}
+QuestService = {}
 
 local function questScreen()
     local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
@@ -490,11 +703,11 @@ end
 local function questStorage()
     local gui = questScreen()
     local quest = gui and gui:FindFirstChild("Quest")
-    local questLocal = quest and quest:FindFirstChild("QuestLocal")
-    return questLocal and questLocal:FindFirstChild("Storage")
+    local localScript = quest and quest:FindFirstChild("QuestLocal")
+    return localScript and localScript:FindFirstChild("Storage")
 end
 
-local function taskComplete(frame, rawText)
+local function taskIsComplete(frame, rawText)
     if rawText:find("<s>", 1, true) then
         return true
     end
@@ -512,7 +725,7 @@ local function taskComplete(frame, rawText)
     return false
 end
 
-local function parseTask(raw)
+local function parseQuestTask(raw)
     local clean = normalize(raw)
     clean = clean:gsub("^[-•]%s*", "")
     clean = clean:gsub("%s*%(%d+%s*/%s*%d+%)%.?$", "")
@@ -529,14 +742,23 @@ local function parseTask(raw)
         {"Deliver", "^Deliver%s+(.+)$"},
         {"Return", "^Return%s+[Tt]o%s+(.+)$"},
         {"Find", "^Find%s+(.+)$"},
+        {"Use", "^Use%s+(.+)$"},
+        {"Equip", "^Equip%s+(.+)$"},
+        {"Craft", "^Craft%s+(.+)$"},
+        {"Fish", "^Catch%s+(.+)$"},
+        {"Fish", "^Fish%s+(.+)$"},
+        {"Mine", "^Mine%s+(.+)$"},
+        {"Farm", "^Harvest%s+(.+)$"},
+        {"Farm", "^Grow%s+(.+)$"},
+        {"Cook", "^Cook%s+(.+)$"},
+        {"Upgrade", "^Upgrade%s+(.+)$"},
+        {"Learn", "^Learn%s+(.+)$"},
     }
 
-    for _, entry in ipairs(patterns) do
-        local target = clean:match(entry[2])
-
+    for _, pattern in ipairs(patterns) do
+        local target = clean:match(pattern[2])
         if target then
-            target = normalize(target:gsub("^['\"]", ""):gsub("['\"]$", ""))
-            return entry[1], target
+            return pattern[1], normalize(target)
         end
     end
 
@@ -554,12 +776,16 @@ function QuestService.GetActiveQuests()
     for _, child in ipairs(scrolling:GetChildren()) do
         if child.Name == "QuestTitle" then
             local questId = child:GetAttribute("QuestId")
+
             if questId ~= nil then
+                local questName = child:GetAttribute("QuestName")
+                local nameLabel = child:FindFirstChild("QuestName", true)
+
                 byId[questId] = {
                     Id = questId,
-                    Name = tostring(
-                        child:GetAttribute("QuestName")
-                        or textOf(findText(child, "QuestName"))
+                    Name = normalize(
+                        questName
+                        or (nameLabel and textOf(nameLabel))
                         or ""
                     ),
                     Tasks = {},
@@ -576,16 +802,16 @@ function QuestService.GetActiveQuests()
 
             if quest then
                 local info = child:FindFirstChild("Info1", true)
-                local rawText = info and tostring(info.Text) or ""
-                local kind, target = parseTask(rawText)
+                local raw = info and tostring(info.Text) or ""
+                local kind, target = parseQuestTask(raw)
 
                 table.insert(quest.Tasks, {
                     Frame = child,
-                    Text = normalize(rawText),
-                    RawText = rawText,
+                    Text = normalize(raw),
+                    RawText = raw,
                     Kind = kind,
                     Target = target,
-                    Complete = taskComplete(child, rawText),
+                    Complete = taskIsComplete(child, raw),
                     LayoutOrder = child.LayoutOrder,
                 })
             end
@@ -600,7 +826,6 @@ function QuestService.GetActiveQuests()
         end)
 
         local complete = #quest.Tasks > 0
-
         for _, taskData in ipairs(quest.Tasks) do
             if not taskData.Complete then
                 complete = false
@@ -663,13 +888,544 @@ function QuestService.GetRecommended()
     }
 end
 
+function QuestService.StateKey()
+    local completed = QuestService.GetCompletedQuest()
+    if completed then
+        return "complete|" .. tostring(completed.Id) .. "|" .. completed.Name
+    end
+
+    local quest, taskData = QuestService.GetNextTask()
+    if quest and taskData then
+        return "task|" .. tostring(quest.Id) .. "|" .. quest.Name .. "|" .. taskData.Text
+    end
+
+    local recommended = QuestService.GetRecommended()
+    if recommended then
+        return "recommended|" .. tostring(recommended.Id) .. "|" .. recommended.Name
+    end
+
+    return "idle"
+end
+
+-- ============================================================
+-- Quest catalog + quest NPC mapping
+-- ============================================================
+
+QuestCatalogService = {}
+
+local function questModulesRoot()
+    local modules = ReplicatedStorage:FindFirstChild("Modules")
+    local questInfo = modules and modules:FindFirstChild("QuestInfo")
+    return questInfo and questInfo:FindFirstChild("Quests")
+end
+
+local function relativePath(root, object)
+    local names = {}
+    local current = object
+
+    while current and current ~= root do
+        table.insert(names, 1, current.Name)
+        current = current.Parent
+    end
+
+    return table.concat(names, "/")
+end
+
+local function findDialogueNpcRoot(descendant)
+    local root = dialogueRoot()
+    if not root then
+        return nil
+    end
+
+    local current = descendant
+    while current and current.Parent do
+        if current:IsA("Model")
+            and current.Parent.Parent == root then
+            return current
+        end
+
+        current = current.Parent
+    end
+
+    return descendant:FindFirstAncestorWhichIsA("Model")
+end
+
+function QuestCatalogService.Build()
+    table.clear(Runtime.QuestCatalog)
+    table.clear(Runtime.QuestCatalogByName)
+    table.clear(Runtime.QuestToNPCs)
+
+    local questsRoot = questModulesRoot()
+    if questsRoot then
+        for _, object in ipairs(questsRoot:GetDescendants()) do
+            if object:IsA("ModuleScript") then
+                local entry = {
+                    Name = object.Name,
+                    Path = relativePath(questsRoot, object),
+                    Module = object,
+                }
+
+                table.insert(Runtime.QuestCatalog, entry)
+
+                local key = lower(object.Name)
+                Runtime.QuestCatalogByName[key] = Runtime.QuestCatalogByName[key] or {}
+                table.insert(Runtime.QuestCatalogByName[key], entry)
+            end
+        end
+
+        table.sort(Runtime.QuestCatalog, function(a, b)
+            return lower(a.Path) < lower(b.Path)
+        end)
+    end
+
+    local root = dialogueRoot()
+    if root then
+        for _, object in ipairs(root:GetDescendants()) do
+            local questName
+
+            if object:IsA("StringValue")
+                and object.Name == "QuestName"
+                and object.Value ~= "" then
+                questName = object.Value
+            end
+
+            local questNode = object:GetAttribute("QuestNode")
+            if type(questNode) == "string" and questNode ~= "" then
+                questName = questName or questNode
+            end
+
+            if object:IsA("TextLabel") and object.Name == "QuestLabel" then
+                local text = normalize(object.Text)
+                if text ~= "" then
+                    questName = questName or text
+                end
+            end
+
+            if questName then
+                local npc = findDialogueNpcRoot(object)
+
+                if npc then
+                    local key = lower(questName)
+                    Runtime.QuestToNPCs[key] = Runtime.QuestToNPCs[key] or {}
+
+                    local exists = false
+                    for _, current in ipairs(Runtime.QuestToNPCs[key]) do
+                        if current == npc then
+                            exists = true
+                            break
+                        end
+                    end
+
+                    if not exists then
+                        table.insert(Runtime.QuestToNPCs[key], npc)
+                    end
+                end
+            end
+        end
+    end
+end
+
+function QuestCatalogService.GetNames()
+    local names = {}
+
+    for _, entry in ipairs(Runtime.QuestCatalog) do
+        table.insert(names, entry.Path)
+    end
+
+    if #names == 0 then
+        table.insert(names, "Quest catalog unavailable")
+    end
+
+    return names
+end
+
+function QuestCatalogService.FindQuestGiver(questName, preferredNpc)
+    if preferredNpc and preferredNpc ~= "" and TargetService then
+        local entity = TargetService.Find(preferredNpc)
+        if entity then
+            return entity
+        end
+    end
+
+    local list = Runtime.QuestToNPCs[lower(questName)] or {}
+    local ownRoot = rootPart()
+    local best
+    local bestDistance
+
+    for _, npc in ipairs(list) do
+        if npc and npc.Parent then
+            local part = objectRoot(npc)
+            if part then
+                local distance = ownRoot and (ownRoot.Position - part.Position).Magnitude or 0
+                if not bestDistance or distance < bestDistance then
+                    best = npc
+                    bestDistance = distance
+                end
+            end
+        end
+    end
+
+    if best then
+        return best
+    end
+
+    -- Partial quest-name fallback.
+    local wanted = lower(questName)
+    for questKey, npcs in pairs(Runtime.QuestToNPCs) do
+        if questKey:find(wanted, 1, true)
+            or wanted:find(questKey, 1, true) then
+
+            for _, npc in ipairs(npcs) do
+                if npc and npc.Parent then
+                    return npc
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
+QuestCatalogService.Build()
+
+-- ============================================================
+-- Hotbar service
+-- ============================================================
+
+HotbarService = {
+    Slots = {},
+    TitleToSlot = {},
+    Hotbar = nil,
+}
+
+local KEY_BY_SLOT = {
+    ["1"] = Enum.KeyCode.One,
+    ["2"] = Enum.KeyCode.Two,
+    ["3"] = Enum.KeyCode.Three,
+    ["4"] = Enum.KeyCode.Four,
+    ["5"] = Enum.KeyCode.Five,
+    ["6"] = Enum.KeyCode.Six,
+    ["7"] = Enum.KeyCode.Seven,
+    ["8"] = Enum.KeyCode.Eight,
+    ["9"] = Enum.KeyCode.Nine,
+    ["0"] = Enum.KeyCode.Zero,
+}
+
+local UTILITY_WORDS = {
+    "key",
+    "fragment",
+    "rock",
+    "ink",
+    "pickaxe",
+    "bait",
+    "food",
+    "map",
+    "pouch",
+    "shovel",
+    "watering",
+    "fertilizer",
+    "seed",
+    "ore",
+}
+
+local COMBAT_WORDS = {
+    "sword",
+    "slash",
+    "punch",
+    "gun",
+    "shot",
+    "cannon",
+    "fist",
+    "claw",
+    "axe",
+    "kick",
+    "sulong",
+    "bomb",
+    "flame",
+    "dark",
+}
+
+local function findHotbar()
+    if HotbarService.Hotbar and HotbarService.Hotbar.Parent then
+        return HotbarService.Hotbar
+    end
+
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local backpack = playerGui and playerGui:FindFirstChild("Backpack")
+    if not backpack then
+        return nil
+    end
+
+    for _, object in ipairs(backpack:GetDescendants()) do
+        if object.Name == "Hotbar" and object:IsA("GuiObject") then
+            HotbarService.Hotbar = object
+            return object
+        end
+    end
+
+    return nil
+end
+
+local function isUtilityTitle(title)
+    local value = lower(title)
+
+    for _, word in ipairs(UTILITY_WORDS) do
+        if value:find(word, 1, true) then
+            return true
+        end
+    end
+
+    return false
+end
+
+function HotbarService.Refresh()
+    table.clear(HotbarService.Slots)
+    table.clear(HotbarService.TitleToSlot)
+
+    local hotbar = findHotbar()
+    if not hotbar then
+        return
+    end
+
+    for _, slot in ipairs(hotbar:GetChildren()) do
+        local key = KEY_BY_SLOT[slot.Name]
+
+        if key then
+            local toolFrame = slot:FindFirstChild("ToolFrame")
+            local title = toolFrame and toolFrame:FindFirstChild("Title", true)
+
+            if title and title:IsA("TextLabel") then
+                local name = normalize(title.Text)
+
+                if name ~= "" then
+                    local data = {
+                        Slot = slot.Name,
+                        Key = key,
+                        Title = name,
+                        Frame = slot,
+                        ToolFrame = toolFrame,
+                        Cooldown = toolFrame and toolFrame:FindFirstChild("Cooldown", true),
+                        EXP = toolFrame and toolFrame:FindFirstChild("EXP", true),
+                        Upgradable = toolFrame and toolFrame:FindFirstChild("Upgradable", true),
+                    }
+
+                    HotbarService.Slots[slot.Name] = data
+                    HotbarService.TitleToSlot[name] = data
+                end
+            end
+        end
+    end
+end
+
+function HotbarService.IsCombat(data)
+    if not data or isUtilityTitle(data.Title) then
+        return false
+    end
+
+    local value = lower(data.Title)
+
+    for _, word in ipairs(COMBAT_WORDS) do
+        if value:find(word, 1, true) then
+            return true
+        end
+    end
+
+    -- Unknown non-utility hotbar slots can still be skills.
+    return true
+end
+
+function HotbarService.IsReady(data)
+    if not data then
+        return false
+    end
+
+    local cooldown = data.Cooldown
+    if cooldown and cooldown:IsA("GuiObject") then
+        return cooldown.Visible == false
+    end
+
+    return true
+end
+
+function HotbarService.Press(data)
+    return data and pressKey(data.Key, 0.03) or false
+end
+
+function HotbarService.AutoCombatSlot()
+    local best
+    local bestScore = -math.huge
+
+    for _, data in pairs(HotbarService.Slots) do
+        if HotbarService.IsCombat(data) then
+            local score = 10
+            local value = lower(data.Title)
+
+            for index, word in ipairs(COMBAT_WORDS) do
+                if value:find(word, 1, true) then
+                    score += 100 - index
+                    break
+                end
+            end
+
+            local slotNumber = tonumber(data.Slot)
+            if slotNumber then
+                score -= slotNumber * 0.01
+            end
+
+            if score > bestScore then
+                best = data
+                bestScore = score
+            end
+        end
+    end
+
+    return best
+end
+
+function HotbarService.ResolveConfigured()
+    HotbarService.Refresh()
+
+    if Config.SelectedWeapon == "Auto" then
+        return HotbarService.AutoCombatSlot()
+    end
+
+    return HotbarService.TitleToSlot[Config.SelectedWeapon]
+end
+
+function HotbarService.GetWeaponOptions()
+    HotbarService.Refresh()
+
+    local result = {"Auto"}
+    local rows = {}
+
+    for _, data in pairs(HotbarService.Slots) do
+        if HotbarService.IsCombat(data) then
+            table.insert(rows, data)
+        end
+    end
+
+    table.sort(rows, function(a, b)
+        return (tonumber(a.Slot) or 99) < (tonumber(b.Slot) or 99)
+    end)
+
+    for _, data in ipairs(rows) do
+        table.insert(result, data.Title)
+    end
+
+    return result
+end
+
+function HotbarService.GetSnapshot()
+    HotbarService.Refresh()
+
+    local rows = {}
+    for slot, data in pairs(HotbarService.Slots) do
+        table.insert(rows, slot .. ": " .. data.Title)
+    end
+
+    table.sort(rows)
+    return #rows > 0 and table.concat(rows, " | ") or "Hotbar unavailable"
+end
+
+-- ============================================================
+-- Target service
+-- ============================================================
+
+TargetService = {}
+
+local function isPlayerEntity(model)
+    return model and (
+        model:GetAttribute("PlayerCharacter") == true
+        or Players:FindFirstChild(model.Name) ~= nil
+    )
+end
+
+function TargetService.IsAliveNPC(model)
+    if not model
+        or not model.Parent
+        or not model:IsA("Model")
+        or isPlayerEntity(model) then
+        return false
+    end
+
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    return objectRoot(model) ~= nil and (not hum or hum.Health > 0)
+end
+
+function TargetService.IsBoss(model)
+    if not TargetService.IsAliveNPC(model) then
+        return false
+    end
+
+    if model:GetAttribute("BossCombat") == true
+        or model:GetAttribute("WorldBoss") == true
+        or model:GetAttribute("Boss") == true then
+        return true
+    end
+
+    local value = lower(
+        model.Name
+        .. " "
+        .. tostring(model:GetAttribute("NPCType") or "")
+        .. " "
+        .. tostring(model:GetAttribute("NPCName") or "")
+    )
+
+    return value:find("boss", 1, true) ~= nil
+end
+
+function TargetService.IsDialogueNPC(model)
+    if not model then
+        return false
+    end
+
+    local interaction = lower(model:GetAttribute("Interaction") or "")
+    local npcType = lower(model:GetAttribute("NPCType") or "")
+
+    if interaction:find("dialogue", 1, true) then
+        return true
+    end
+
+    if npcType == "civilian" and model:GetAttribute("Combat") ~= true then
+        return true
+    end
+
+    local root = dialogueRoot()
+    return root and model:IsDescendantOf(root) or false
+end
+
+function TargetService.IsHostile(model)
+    if not TargetService.IsAliveNPC(model)
+        or TargetService.IsDialogueNPC(model) then
+        return false
+    end
+
+    if TargetService.IsBoss(model) then
+        return true
+    end
+
+    if model:GetAttribute("Combat") == true
+        or model:GetAttribute("NPCCombat") == true then
+        return true
+    end
+
+    local party = lower(
+        model:GetAttribute("Party")
+        or model:GetAttribute("DefaultParty")
+        or ""
+    )
+
+    return party:find("enemy", 1, true) ~= nil
+        or party:find("corrupt", 1, true) ~= nil
+        or party:find("hostile", 1, true) ~= nil
+end
+
 local function npcMatches(model, targetName)
     if not model or not targetName or targetName == "" then
         return false
     end
 
     local wanted = lower(targetName)
-
     local candidates = {
         model.Name,
         stripRuntimeSuffix(model.Name),
@@ -693,419 +1449,30 @@ local function npcMatches(model, targetName)
     return false
 end
 
-local function dialogueQuestNames(model)
-    if not model then
-        return {}
+function TargetService.IsFarmMob(model, wanted)
+    if not TargetService.IsAliveNPC(model)
+        or TargetService.IsDialogueNPC(model) then
+        return false
     end
 
-    local cached = Runtime.DialogueQuestNames[model]
-    if cached then
-        return cached
-    end
-
-    local names = {}
-
-    for _, descendant in ipairs(model:GetDescendants()) do
-        if descendant:IsA("StringValue")
-            and descendant.Name == "QuestName"
-            and descendant.Value ~= "" then
-
-            names[normalize(descendant.Value)] = true
+    if wanted == "Boss Only" then
+        return TargetService.IsBoss(model)
+    elseif wanted == "Nearest Hostile" then
+        return TargetService.IsHostile(model)
+    elseif wanted == "Any Hostile" then
+        return TargetService.IsHostile(model)
+    elseif wanted and wanted ~= "" then
+        if not npcMatches(model, wanted) then
+            return false
         end
 
-        local questNode = descendant:GetAttribute("QuestNode")
-        if type(questNode) == "string" and questNode ~= "" then
-            names[normalize(questNode)] = true
-        end
-
-        if descendant:IsA("TextLabel") and descendant.Name == "QuestLabel" then
-            local value = normalize(descendant.Text)
-            if value ~= "" then
-                names[value] = true
-            end
-        end
-    end
-
-    Runtime.DialogueQuestNames[model] = names
-    return names
-end
-
-function QuestService.FindDialogueNPC(questName, preferredName)
-    local wantedQuest = lower(questName)
-    local ownRoot = rootPart()
-    local candidates = {}
-
-    for model in pairs(Runtime.DialogueNPCs) do
-        if model and model.Parent then
-            candidates[model] = true
-        end
-    end
-
-    local dialogues = dialogueRoot()
-    if dialogues then
-        for _, island in ipairs(dialogues:GetChildren()) do
-            for _, child in ipairs(island:GetChildren()) do
-                if child:IsA("Model") then
-                    candidates[child] = true
-                end
-            end
-        end
-    end
-
-    local best
-    local bestDistance
-
-    for model in pairs(candidates) do
-        local matched = preferredName and preferredName ~= "" and npcMatches(model, preferredName)
-
-        if not matched and wantedQuest ~= "" then
-            for name in pairs(dialogueQuestNames(model)) do
-                if lower(name) == wantedQuest then
-                    matched = true
-                    break
-                end
-            end
-        end
-
-        if matched then
-            local part = objectRoot(model)
-
-            if part then
-                local distance = ownRoot and (ownRoot.Position - part.Position).Magnitude or 0
-
-                if not bestDistance or distance < bestDistance then
-                    best = model
-                    bestDistance = distance
-                end
-            end
-        end
-    end
-
-    return best
-end
-
-function QuestService.StateKey()
-    local quest, taskData = QuestService.GetNextTask()
-    if quest and taskData then
-        return "active|" .. tostring(quest.Id) .. "|" .. quest.Name .. "|" .. taskData.Text
-    end
-
-    local complete = QuestService.GetCompletedQuest()
-    if complete then
-        return "complete|" .. tostring(complete.Id) .. "|" .. complete.Name
-    end
-
-    local recommended = QuestService.GetRecommended()
-    if recommended then
-        return "recommended|" .. tostring(recommended.Id) .. "|" .. recommended.Name
-    end
-
-    return "idle"
-end
-
--- ============================================================
--- HotbarService
--- Uses the custom Backpack/Hotbar confirmed in the dump
--- ============================================================
-
-local HotbarService = {
-    Slots = {},
-    TitleToSlot = {},
-}
-
-local KEY_BY_SLOT = {
-    ["1"] = Enum.KeyCode.One,
-    ["2"] = Enum.KeyCode.Two,
-    ["3"] = Enum.KeyCode.Three,
-    ["4"] = Enum.KeyCode.Four,
-    ["5"] = Enum.KeyCode.Five,
-    ["6"] = Enum.KeyCode.Six,
-    ["7"] = Enum.KeyCode.Seven,
-    ["8"] = Enum.KeyCode.Eight,
-    ["9"] = Enum.KeyCode.Nine,
-    ["0"] = Enum.KeyCode.Zero,
-}
-
-local NON_COMBAT_WORDS = {
-    "key",
-    "fragment",
-    "rock",
-    "ink",
-    "pickaxe",
-    "bait",
-    "food",
-    "map",
-    "pouch",
-    "shovel",
-    "watering",
-    "fertilizer",
-}
-
-local COMBAT_PRIORITY = {
-    "sword",
-    "slash",
-    "punch",
-    "gun",
-    "shot",
-    "cannon",
-    "fist",
-    "claw",
-    "axe",
-    "kick",
-}
-
-local function findHotbar()
-    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-    local backpackGui = playerGui and playerGui:FindFirstChild("Backpack")
-
-    if not backpackGui then
-        return nil
-    end
-
-    for _, descendant in ipairs(backpackGui:GetDescendants()) do
-        if descendant.Name == "Hotbar" and descendant:IsA("GuiObject") then
-            return descendant
-        end
-    end
-
-    return nil
-end
-
-function HotbarService.Refresh()
-    table.clear(HotbarService.Slots)
-    table.clear(HotbarService.TitleToSlot)
-
-    local hotbar = findHotbar()
-    if not hotbar then
-        return
-    end
-
-    for _, slot in ipairs(hotbar:GetChildren()) do
-        if KEY_BY_SLOT[slot.Name] then
-            local toolFrame = slot:FindFirstChild("ToolFrame")
-            local title = toolFrame and toolFrame:FindFirstChild("Title", true)
-
-            if title and title:IsA("TextLabel") then
-                local name = normalize(title.Text)
-
-                if name ~= "" then
-                    local data = {
-                        Slot = slot.Name,
-                        Key = KEY_BY_SLOT[slot.Name],
-                        Title = name,
-                        Frame = slot,
-                    }
-
-                    HotbarService.Slots[slot.Name] = data
-                    HotbarService.TitleToSlot[name] = data
-                end
-            end
-        end
-    end
-end
-
-local function isUtilityTitle(title)
-    local value = lower(title)
-
-    for _, word in ipairs(NON_COMBAT_WORDS) do
-        if value:find(word, 1, true) then
-            return true
-        end
+        -- Exact quest-name target can be accepted even if party metadata is incomplete,
+        -- but never a dialogue-only NPC.
+        return TargetService.IsHostile(model)
+            or model:FindFirstChildOfClass("Humanoid") ~= nil
     end
 
     return false
-end
-
-function HotbarService.AutoCombatSlot()
-    local best
-    local bestScore = -math.huge
-
-    for _, data in pairs(HotbarService.Slots) do
-        if not isUtilityTitle(data.Title) then
-            local title = lower(data.Title)
-            local score = 10
-
-            for index, word in ipairs(COMBAT_PRIORITY) do
-                if title:find(word, 1, true) then
-                    score += 100 - index
-                    break
-                end
-            end
-
-            local numericSlot = tonumber(data.Slot)
-            if numericSlot then
-                score -= numericSlot * 0.01
-            end
-
-            if score > bestScore then
-                best = data
-                bestScore = score
-            end
-        end
-    end
-
-    return best
-end
-
-function HotbarService.Resolve(title)
-    if title == "Auto" then
-        return HotbarService.AutoCombatSlot()
-    end
-
-    return HotbarService.TitleToSlot[title]
-end
-
-function HotbarService.Press(data)
-    if not data or not data.Key then
-        return false
-    end
-
-    return pcall(function()
-        VirtualInputManager:SendKeyEvent(true, data.Key, false, game)
-        task.wait(0.03)
-        VirtualInputManager:SendKeyEvent(false, data.Key, false, game)
-    end)
-end
-
-function HotbarService.SelectConfigured()
-    if next(HotbarService.Slots) == nil then
-        HotbarService.Refresh()
-    end
-
-    local data = HotbarService.Resolve(Config.SelectedWeapon)
-    if not data then
-        return nil
-    end
-
-    local now = os.clock()
-
-    if Runtime.LastWeaponTitle ~= data.Title
-        or now - Runtime.LastWeaponEquip > 8 then
-
-        Runtime.LastWeaponTitle = data.Title
-        Runtime.LastWeaponEquip = now
-        HotbarService.Press(data)
-    end
-
-    return data
-end
-
-function HotbarService.GetOptions()
-    HotbarService.Refresh()
-
-    local options = {"Auto"}
-    local list = {}
-
-    for _, data in pairs(HotbarService.Slots) do
-        table.insert(list, data)
-    end
-
-    table.sort(list, function(a, b)
-        local an = tonumber(a.Slot) or 99
-        local bn = tonumber(b.Slot) or 99
-        return an < bn
-    end)
-
-    for _, data in ipairs(list) do
-        table.insert(options, data.Title)
-    end
-
-    return options
-end
-
-function HotbarService.GetSnapshot()
-    HotbarService.Refresh()
-
-    local rows = {}
-
-    for slot, data in pairs(HotbarService.Slots) do
-        table.insert(rows, slot .. ": " .. data.Title)
-    end
-
-    table.sort(rows)
-    return #rows > 0 and table.concat(rows, " | ") or "Hotbar unavailable"
-end
-
--- ============================================================
--- TargetService
--- ============================================================
-
-local TargetService = {}
-
-local function isPlayerEntity(model)
-    return model
-        and (
-            model:GetAttribute("PlayerCharacter") == true
-            or Players:FindFirstChild(model.Name) ~= nil
-        )
-end
-
-function TargetService.IsAliveNPC(model)
-    if not model or not model.Parent or not model:IsA("Model") or isPlayerEntity(model) then
-        return false
-    end
-
-    local hum = model:FindFirstChildOfClass("Humanoid")
-    return objectRoot(model) ~= nil and (not hum or hum.Health > 0)
-end
-
-function TargetService.IsBoss(model)
-    if not TargetService.IsAliveNPC(model) then
-        return false
-    end
-
-    if model:GetAttribute("BossCombat") == true
-        or model:GetAttribute("WorldBoss") == true
-        or model:GetAttribute("Boss") == true then
-        return true
-    end
-
-    local text = lower(
-        model.Name
-        .. " "
-        .. tostring(model:GetAttribute("NPCType") or "")
-        .. " "
-        .. tostring(model:GetAttribute("NPCName") or "")
-    )
-
-    return text:find("boss", 1, true) ~= nil
-end
-
-function TargetService.IsHostile(model)
-    if not TargetService.IsAliveNPC(model) then
-        return false
-    end
-
-    if TargetService.IsBoss(model) then
-        return true
-    end
-
-    if model:GetAttribute("Combat") == true
-        or model:GetAttribute("NPCCombat") == true then
-        return true
-    end
-
-    local party = lower(model:GetAttribute("Party") or model:GetAttribute("DefaultParty") or "")
-
-    return party:find("enemy", 1, true) ~= nil
-        or party:find("corrupt", 1, true) ~= nil
-        or party:find("hostile", 1, true) ~= nil
-end
-
-function TargetService.Matches(model, wanted)
-    if not TargetService.IsAliveNPC(model) then
-        return false
-    end
-
-    if wanted == "Any NPC" then
-        return true
-    elseif wanted == "Nearest Hostile" then
-        return TargetService.IsHostile(model)
-    elseif wanted == "Boss Only" then
-        return TargetService.IsBoss(model)
-    end
-
-    return npcMatches(model, wanted)
 end
 
 function TargetService.Find(wanted)
@@ -1113,9 +1480,11 @@ function TargetService.Find(wanted)
     local bestDistance
 
     for model in pairs(Runtime.Entities) do
-        if model and model.Parent and TargetService.Matches(model, wanted) then
-            local distance = distanceTo(model)
+        if model
+            and model.Parent
+            and TargetService.IsFarmMob(model, wanted) then
 
+            local distance = distanceTo(model)
             if not bestDistance or distance < bestDistance then
                 best = model
                 bestDistance = distance
@@ -1126,117 +1495,220 @@ function TargetService.Find(wanted)
     return best
 end
 
-function TargetService.FindBoss()
-    return TargetService.Find("Boss Only")
+function TargetService.FindNamedNPC(name)
+    local best
+    local bestDistance
+
+    for model in pairs(Runtime.Entities) do
+        if model and model.Parent and npcMatches(model, name) then
+            local distance = distanceTo(model)
+            if not bestDistance or distance < bestDistance then
+                best = model
+                bestDistance = distance
+            end
+        end
+    end
+
+    return best
 end
 
 function TargetService.GetMobOptions()
     local set = {
         ["Nearest Hostile"] = true,
-        ["Any NPC"] = true,
         ["Boss Only"] = true,
     }
 
-    local entities = entitiesFolder()
+    local folder = entitiesFolder()
+    if folder then
+        for _, model in ipairs(folder:GetChildren()) do
+            if model:IsA("Model")
+                and not isPlayerEntity(model)
+                and not TargetService.IsDialogueNPC(model) then
 
-    if entities then
-        for _, model in ipairs(entities:GetChildren()) do
-            if model:IsA("Model") and not isPlayerEntity(model) then
-                local value = tostring(
+                local name = tostring(
                     model:GetAttribute("NPCType")
                     or model:GetAttribute("NPCName")
                     or stripRuntimeSuffix(model.Name)
                 )
 
-                if value ~= "" then
-                    set[value] = true
+                if name ~= "" then
+                    set[name] = true
                 end
             end
         end
     end
 
-    local options = {}
-
-    for value in pairs(set) do
-        table.insert(options, value)
+    local result = {}
+    for name in pairs(set) do
+        table.insert(result, name)
     end
 
-    table.sort(options)
-    return options
+    table.sort(result)
+    return result
 end
 
 -- ============================================================
--- TweenController
+-- Platform transport
 -- ============================================================
 
-local TweenController = {}
+PlatformTransport = {}
 
-function TweenController.Cancel()
-    if Runtime.CurrentTween then
+local PLATFORM_NAME = "SON_TransportPlatform"
+
+local function transportPlatformCFrameForRoot(rootGoal)
+    return rootGoal * CFrame.new(0, -3.25, 0)
+end
+
+function PlatformTransport.Ensure()
+    local part = Runtime.TransportPart
+
+    if part and part.Parent then
+        part.Size = Vector3.new(Config.PlatformSize, 1, Config.PlatformSize)
+        part.Transparency = Config.PlatformTransparency
+        return part
+    end
+
+    local root = rootPart()
+    if not root then
+        return nil
+    end
+
+    part = Instance.new("Part")
+    part.Name = PLATFORM_NAME
+    part.Anchored = true
+    part.CanCollide = true
+    part.CanTouch = false
+    part.CanQuery = false
+    part.CastShadow = false
+    part.Material = Enum.Material.SmoothPlastic
+    part.Size = Vector3.new(Config.PlatformSize, 1, Config.PlatformSize)
+    part.Transparency = Config.PlatformTransparency
+    part.CFrame = root.CFrame * CFrame.new(0, -3.25, 0)
+    part.Parent = Workspace
+
+    Runtime.TransportPart = part
+    track(part)
+
+    return part
+end
+
+function PlatformTransport.DestroyWeld()
+    if Runtime.TransportWeld then
         pcall(function()
-            Runtime.CurrentTween:Cancel()
+            Runtime.TransportWeld:Destroy()
         end)
     end
 
-    Runtime.CurrentTween = nil
-    Runtime.CurrentTweenTarget = nil
+    Runtime.TransportWeld = nil
 end
 
-local function movementGoal(targetPart, height, back)
-    local position = (
-        targetPart.CFrame
-        * CFrame.new(0, height or Config.FarmHeight, back or Config.FarmBack)
-    ).Position
+function PlatformTransport.Cancel(keepPlatform)
+    if Runtime.TransportTween then
+        pcall(function()
+            Runtime.TransportTween:Cancel()
+        end)
+    end
 
-    return CFrame.lookAt(position, targetPart.Position)
+    Runtime.TransportTween = nil
+    Runtime.TransportGoal = nil
+    Runtime.TransportMoving = false
+
+    PlatformTransport.DestroyWeld()
+
+    if keepPlatform == false and Runtime.TransportPart then
+        pcall(function()
+            Runtime.TransportPart:Destroy()
+        end)
+        Runtime.TransportPart = nil
+    end
 end
 
-function TweenController.MoveTo(object, height, back)
-    local ownRoot = rootPart()
-    local targetPart = objectRoot(object)
+function PlatformTransport.MoveToRootCFrame(rootGoal)
+    local root = rootPart()
+    local part = PlatformTransport.Ensure()
 
-    if not ownRoot or not targetPart then
+    if not root or not part or not rootGoal then
         return false, "missing"
     end
 
-    local distance = (ownRoot.Position - targetPart.Position).Magnitude
+    local distance = (root.Position - rootGoal.Position).Magnitude
 
-    if distance <= Config.ArrivalDistance then
-        TweenController.Cancel()
+    if distance <= Config.PlatformArrivalDistance then
+        PlatformTransport.Cancel(true)
+
+        pcall(function()
+            part.CFrame = root.CFrame * CFrame.new(0, -3.25, 0)
+        end)
+
         return true, "arrived"
     end
 
-    if not Config.TweenEnabled then
+    if not Config.PlatformTransport then
         return false, "disabled"
     end
 
-    if Runtime.CurrentTweenTarget == targetPart and Runtime.CurrentTween then
-        return false, "moving"
+    local platformGoal = transportPlatformCFrameForRoot(rootGoal)
+
+    if Runtime.TransportTween and Runtime.TransportGoal then
+        local moved = (
+            Runtime.TransportGoal.Position
+            - platformGoal.Position
+        ).Magnitude
+
+        if moved < Config.PlatformRetargetDistance then
+            return false, "moving"
+        end
     end
 
-    TweenController.Cancel()
+    PlatformTransport.Cancel(true)
+
+    -- Re-seat the platform directly under the player before attaching.
+    part.CFrame = root.CFrame * CFrame.new(0, -3.25, 0)
+    part.Size = Vector3.new(Config.PlatformSize, 1, Config.PlatformSize)
+    part.Transparency = Config.PlatformTransparency
+
+    local weld = Instance.new("WeldConstraint")
+    weld.Name = "SON_TransportWeld"
+    weld.Part0 = part
+    weld.Part1 = root
+    weld.Parent = part
+    Runtime.TransportWeld = weld
 
     local duration = math.clamp(
-        distance / math.max(40, Config.TweenSpeed),
-        0.08,
+        distance / math.max(40, Config.PlatformSpeed),
+        0.12,
         12
     )
 
     local tween = TweenService:Create(
-        ownRoot,
-        TweenInfo.new(duration, Enum.EasingStyle.Linear, Enum.EasingDirection.Out),
-        {
-            CFrame = movementGoal(targetPart, height, back),
-        }
+        part,
+        TweenInfo.new(
+            duration,
+            Enum.EasingStyle.Linear,
+            Enum.EasingDirection.Out
+        ),
+        {CFrame = platformGoal}
     )
 
-    Runtime.CurrentTween = tween
-    Runtime.CurrentTweenTarget = targetPart
+    Runtime.TransportTween = tween
+    Runtime.TransportGoal = platformGoal
+    Runtime.TransportMoving = true
 
     tween.Completed:Connect(function()
-        if Runtime.CurrentTween == tween then
-            Runtime.CurrentTween = nil
-            Runtime.CurrentTweenTarget = nil
+        if Runtime.TransportTween == tween then
+            Runtime.TransportTween = nil
+            Runtime.TransportGoal = nil
+            Runtime.TransportMoving = false
+
+            PlatformTransport.DestroyWeld()
+
+            local currentRoot = rootPart()
+            if currentRoot then
+                pcall(function()
+                    currentRoot.AssemblyLinearVelocity = Vector3.zero
+                    currentRoot.AssemblyAngularVelocity = Vector3.zero
+                end)
+            end
         end
     end)
 
@@ -1244,24 +1716,95 @@ function TweenController.MoveTo(object, height, back)
     return false, "started"
 end
 
+function PlatformTransport.MoveAbove(object)
+    local target = objectRoot(object)
+    if not target then
+        return false, "missing target"
+    end
+
+    local position = target.Position + Vector3.new(
+        0,
+        Config.PlatformFarmHeight,
+        0
+    )
+
+    local goal = CFrame.lookAt(
+        position,
+        Vector3.new(target.Position.X, position.Y, target.Position.Z)
+    )
+
+    return PlatformTransport.MoveToRootCFrame(goal)
+end
+
+function PlatformTransport.MoveNear(object)
+    local target = objectRoot(object)
+    if not target then
+        return false, "missing target"
+    end
+
+    local position = (
+        target.CFrame
+        * CFrame.new(
+            0,
+            Config.PlatformNpcHeight,
+            Config.PlatformBackDistance
+        )
+    ).Position
+
+    local goal = CFrame.lookAt(position, target.Position)
+    return PlatformTransport.MoveToRootCFrame(goal)
+end
+
+function PlatformTransport.SetFarmAnchorFrom(object)
+    local target = objectRoot(object)
+    if not target then
+        return nil
+    end
+
+    local position = target.Position + Vector3.new(
+        0,
+        Config.PlatformFarmHeight,
+        0
+    )
+
+    Runtime.FarmAnchorCFrame = CFrame.lookAt(
+        position,
+        Vector3.new(target.Position.X, position.Y, target.Position.Z)
+    )
+
+    return Runtime.FarmAnchorCFrame
+end
+
+function PlatformTransport.MoveToFarmAnchor()
+    if not Runtime.FarmAnchorCFrame then
+        return false, "no anchor"
+    end
+
+    return PlatformTransport.MoveToRootCFrame(Runtime.FarmAnchorCFrame)
+end
+
 -- ============================================================
--- BringService
--- Best-effort client-side stacking; no network ownership bypass
+-- Bring / hitbox
 -- ============================================================
 
-local BringService = {}
+BringService = {}
 
 function BringService.Step(wanted)
     if not Config.BringMobs then
         return
     end
 
-    local ownRoot = rootPart()
-    if not ownRoot then
+    local now = os.clock()
+    if now - Runtime.LastBring < 0.28 then
+        return
+    end
+    Runtime.LastBring = now
+
+    local root = rootPart()
+    if not root then
         return
     end
 
-    local stackBase = ownRoot.CFrame * CFrame.new(0, 0, -Config.BringDistance)
     local count = 0
 
     for model in pairs(Runtime.Entities) do
@@ -1269,167 +1812,198 @@ function BringService.Step(wanted)
             break
         end
 
-        if model and model.Parent
-            and TargetService.Matches(model, wanted)
+        if model
+            and model.Parent
+            and TargetService.IsFarmMob(model, wanted)
             and (Config.BringBosses or not TargetService.IsBoss(model)) then
 
-            local part = objectRoot(model)
-            local hum = model:FindFirstChildOfClass("Humanoid")
+            local part = model:FindFirstChild("HumanoidRootPart")
+                or objectRoot(model)
 
             if part
                 and not part.Anchored
-                and (not hum or hum.Health > 0)
-                and (part.Position - ownRoot.Position).Magnitude <= Config.BringRadius then
+                and (part.Position - root.Position).Magnitude <= Config.BringRadius then
 
                 count += 1
 
+                local column = ((count - 1) % 3) - 1
                 local row = math.floor((count - 1) / 3)
-                local column = (count - 1) % 3
-                local offset = CFrame.new((column - 1) * 1.2, 0, row * 1.1)
+
+                local destination = root.CFrame * CFrame.new(
+                    column * Config.BringSpread,
+                    -Config.MobBelowFeet,
+                    row * Config.BringSpread
+                )
 
                 pcall(function()
                     part.AssemblyLinearVelocity = Vector3.zero
                     part.AssemblyAngularVelocity = Vector3.zero
-                    part.CFrame = stackBase * offset
+                    part.CFrame = destination
                 end)
             end
         end
     end
 end
 
--- ============================================================
--- InteractionService
--- ============================================================
+HitboxService = {}
 
-local InteractionService = {}
-
-local firePromptFunction = type(fireproximityprompt) == "function" and fireproximityprompt or nil
-
-function InteractionService.FirePrompt(prompt)
-    if not prompt or not prompt.Parent or not prompt.Enabled then
-        return false
-    end
-
-    if firePromptFunction then
-        return pcall(function()
-            firePromptFunction(prompt, math.max(0, prompt.HoldDuration or 0))
-        end)
-    end
-
-    local key = prompt.KeyboardKeyCode
-    if not key or key == Enum.KeyCode.Unknown then
-        return false
-    end
-
-    return pcall(function()
-        VirtualInputManager:SendKeyEvent(true, key, false, game)
-        task.wait(math.max(0.06, (prompt.HoldDuration or 0) + 0.03))
-        VirtualInputManager:SendKeyEvent(false, key, false, game)
-    end)
-end
-
-function InteractionService.Click(button)
-    if not button or not button:IsA("GuiButton") or not isGuiVisible(button) then
-        return false
-    end
-
-    if type(firesignal) == "function" then
-        local ok = pcall(function()
-            firesignal(button.Activated)
-        end)
-
-        if ok then
-            return true
-        end
-    end
-
-    local position = button.AbsolutePosition
-    local size = button.AbsoluteSize
-
-    return pcall(function()
-        local x = position.X + size.X / 2
-        local y = position.Y + size.Y / 2
-
-        VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 0)
-        task.wait(0.025)
-        VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 0)
-    end)
-end
-
-function InteractionService.ProcessDialogue()
-    if not Config.AutoDialogue then
+function HitboxService.Restore(model)
+    local data = Runtime.ExpandedHitboxes[model]
+    if not data then
         return
     end
 
-    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-    local dialogue = playerGui and playerGui:FindFirstChild("DialogueUI")
+    local part = data.Part
+    if part and part.Parent then
+        pcall(function()
+            part.Size = data.Size
+            part.Transparency = data.Transparency
+            part.CanCollide = data.CanCollide
+            part.Massless = data.Massless
+        end)
+    end
 
-    if not dialogue then
+    Runtime.ExpandedHitboxes[model] = nil
+end
+
+function HitboxService.Clear()
+    for model in pairs(Runtime.ExpandedHitboxes) do
+        HitboxService.Restore(model)
+    end
+end
+
+function HitboxService.Apply(model, wanted)
+    -- Strict mob-only condition.
+    if not Config.MobHitbox
+        or not TargetService.IsFarmMob(model, wanted)
+        or (TargetService.IsBoss(model) and not Config.HitboxBosses) then
+
+        HitboxService.Restore(model)
         return
     end
 
-    local words = {
-        "accept",
-        "continue",
-        "next",
-        "yes",
-        "start quest",
-        "take quest",
-        "complete",
-        "finish",
-    }
+    local part = model:FindFirstChild("HumanoidRootPart")
+        or model:FindFirstChild("UpperTorso")
+        or model:FindFirstChild("Torso")
 
-    for _, object in ipairs(dialogue:GetDescendants()) do
-        if object:IsA("GuiButton") and isGuiVisible(object) then
-            local text = lower(object.Name .. " " .. textOf(object))
+    if not part then
+        return
+    end
 
-            for _, word in ipairs(words) do
-                if text:find(word, 1, true) then
-                    InteractionService.Click(object)
-                    return
-                end
+    if not Runtime.ExpandedHitboxes[model] then
+        Runtime.ExpandedHitboxes[model] = {
+            Part = part,
+            Size = part.Size,
+            Transparency = part.Transparency,
+            CanCollide = part.CanCollide,
+            Massless = part.Massless,
+        }
+    end
+
+    pcall(function()
+        part.Size = Vector3.new(
+            Config.HitboxSize,
+            Config.HitboxSize,
+            Config.HitboxSize
+        )
+        part.Transparency = Config.HitboxTransparency
+        part.CanCollide = false
+        part.Massless = true
+    end)
+end
+
+function HitboxService.Step(wanted)
+    local now = os.clock()
+    if now - Runtime.LastHitbox < 0.35 then
+        return
+    end
+    Runtime.LastHitbox = now
+
+    local keep = {}
+
+    if Config.MobHitbox then
+        for model in pairs(Runtime.Entities) do
+            if model
+                and model.Parent
+                and TargetService.IsFarmMob(model, wanted) then
+
+                keep[model] = true
+                HitboxService.Apply(model, wanted)
             end
         end
     end
+
+    for model in pairs(Runtime.ExpandedHitboxes) do
+        if not keep[model] then
+            HitboxService.Restore(model)
+        end
+    end
 end
 
-function InteractionService.ProcessClaims()
-    if not Config.AutoClaim then
-        return
-    end
+-- ============================================================
+-- Small GUI caches
+-- ============================================================
 
+local function cacheClaimButton(object)
+    if object
+        and object:IsA("GuiButton")
+        and lower(object.Name .. " " .. textOf(object)):find("claim", 1, true) then
+        Runtime.ClaimButtons[object] = true
+    end
+end
+
+local function initGuiCaches()
     local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
     if not playerGui then
         return
     end
 
-    for _, object in ipairs(playerGui:GetDescendants()) do
-        if object:IsA("GuiButton")
-            and isGuiVisible(object)
-            and lower(object.Name .. " " .. textOf(object)):find("claim", 1, true) then
+    local descendants = playerGui:GetDescendants()
 
-            InteractionService.Click(object)
-            return
+    for index, object in ipairs(descendants) do
+        cacheClaimButton(object)
+
+        if index % 4000 == 0 then
+            task.wait()
         end
     end
+
+    connect(playerGui.DescendantAdded, cacheClaimButton)
+    connect(playerGui.DescendantRemoving, function(object)
+        Runtime.ClaimButtons[object] = nil
+    end)
 end
+
+task.spawn(initGuiCaches)
+
+-- ============================================================
+-- Interaction service
+-- ============================================================
+
+InteractionService = {}
+
+local firePromptFn = type(fireproximityprompt) == "function"
+    and fireproximityprompt
+    or nil
 
 local function promptKind(prompt)
     local name = lower(prompt.Name)
-    local fullName = lower(prompt:GetFullName())
+    local path = lower(prompt:GetFullName())
 
     if name:find("fruit chest", 1, true) then
         return "FruitChest"
     elseif name:find("world boss chest", 1, true) then
         return "WorldBossChest"
-    elseif name == "chest" or name:find("chest", 1, true) then
+    elseif name:find("chest", 1, true) then
         return "Chest"
+    elseif name:find("dialogue", 1, true) then
+        return "Dialogue"
     elseif name:find("ore", 1, true)
-        or fullName:find(".ores.", 1, true) then
+        or path:find(".ores.", 1, true) then
         return "Ore"
-    elseif fullName:find(".crops.", 1, true)
-        or fullName:find(".farmgear.", 1, true)
-        or fullName:find(".pests.", 1, true) then
+    elseif path:find(".crops.", 1, true)
+        or path:find(".farmgear.", 1, true)
+        or path:find(".pests.", 1, true) then
         return "Farm"
     elseif name:find("quest", 1, true)
         or name:find("mission", 1, true)
@@ -1440,38 +2014,38 @@ local function promptKind(prompt)
         or name == "steal"
         or name == "grab" then
         return "Pickup"
-    elseif name:find("dialogue", 1, true) then
-        return "Dialogue"
     end
 
     return "Other"
 end
 
-function InteractionService.FindNearestPrompt(filter, maxDistance)
-    local best
-    local bestDistance = maxDistance or math.huge
+function InteractionService.FirePrompt(prompt)
+    if not prompt
+        or not prompt.Parent
+        or not prompt:IsA("ProximityPrompt")
+        or not prompt.Enabled then
+        return false
+    end
 
-    for prompt in pairs(Runtime.Prompts) do
-        if prompt and prompt.Parent and prompt.Enabled then
-            local accepted = not filter or filter(prompt, promptKind(prompt))
+    if firePromptFn then
+        local ok = pcall(function()
+            firePromptFn(prompt, math.max(0, prompt.HoldDuration or 0))
+        end)
 
-            if accepted then
-                local distance = distanceTo(prompt)
-
-                if distance < bestDistance then
-                    best = prompt
-                    bestDistance = distance
-                end
-            end
+        if ok then
+            return true
         end
     end
 
-    return best, bestDistance
+    return pressKey(
+        prompt.KeyboardKeyCode,
+        math.max(0.06, (prompt.HoldDuration or 0) + 0.03)
+    )
 end
 
-function InteractionService.FindPromptNear(object, preferredKind)
-    local targetPart = objectRoot(object)
-    if not targetPart then
+function InteractionService.FindPromptNear(object, desiredKind)
+    local target = objectRoot(object)
+    if not target then
         return nil
     end
 
@@ -1483,11 +2057,12 @@ function InteractionService.FindPromptNear(object, preferredKind)
             local part = objectRoot(prompt)
 
             if part then
-                local distance = (part.Position - targetPart.Position).Magnitude
-                local accepted = not preferredKind or promptKind(prompt) == preferredKind
+                local distance = (part.Position - target.Position).Magnitude
+                local correctKind = not desiredKind
+                    or promptKind(prompt) == desiredKind
 
-                if accepted
-                    and distance <= 30
+                if correctKind
+                    and distance <= 35
                     and (not bestDistance or distance < bestDistance) then
 
                     best = prompt
@@ -1500,31 +2075,305 @@ function InteractionService.FindPromptNear(object, preferredKind)
     return best
 end
 
-function InteractionService.FindPromptByText(targetName)
-    local wanted = lower(targetName)
+function InteractionService.FindPromptByText(text, allowedKinds)
+    local wanted = lower(text)
+    local best
+    local bestDistance
 
-    return InteractionService.FindNearestPrompt(function(prompt)
-        local model = prompt:FindFirstAncestorWhichIsA("Model")
+    for prompt in pairs(Runtime.Prompts) do
+        if prompt and prompt.Parent and prompt.Enabled then
+            local kind = promptKind(prompt)
+            local kindAllowed = not allowedKinds or allowedKinds[kind]
 
-        local text = lower(
-            prompt.Name
-            .. " "
-            .. tostring(prompt.ActionText or "")
-            .. " "
-            .. tostring(prompt.ObjectText or "")
-            .. " "
-            .. tostring(model and model.Name or "")
-        )
+            if kindAllowed then
+                local model = prompt:FindFirstAncestorWhichIsA("Model")
 
-        return text:find(wanted, 1, true) ~= nil
-    end)
+                local blob = lower(table.concat({
+                    prompt.Name,
+                    tostring(prompt.ActionText or ""),
+                    tostring(prompt.ObjectText or ""),
+                    model and model.Name or "",
+                }, " "))
+
+                if blob:find(wanted, 1, true) then
+                    local distance = distanceTo(prompt)
+
+                    if not bestDistance or distance < bestDistance then
+                        best = prompt
+                        bestDistance = distance
+                    end
+                end
+            end
+        end
+    end
+
+    return best
+end
+
+local function dialogueUI()
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    return playerGui and playerGui:FindFirstChild("DialogueUI")
+end
+
+local function dialogueIsOpen()
+    local ui = dialogueUI()
+    return ui and (not ui:IsA("ScreenGui") or ui.Enabled)
+end
+
+local function scoreDialogueButton(button, questName)
+    if not button
+        or not button:IsA("ImageButton")
+        or isScriptTemplateDescendant(button)
+        or not isOnScreen(button) then
+        return nil
+    end
+
+    local wanted = lower(questName)
+    local parent = button.Parent
+    local text = parent and textOf(parent) or ""
+    local blob = lower((parent and parent.Name or "") .. " " .. text)
+
+    local score = 1
+
+    if wanted ~= "" and blob:find(wanted, 1, true) then
+        score += 120
+    end
+
+    local questGlow = parent and parent:FindFirstChild("Quest Glow", true)
+    if questGlow and questGlow:IsA("GuiObject") and questGlow.Visible then
+        score += 90
+    end
+
+    for _, word in ipairs({
+        "quest",
+        "help",
+        "training",
+        "accept",
+        "continue",
+        "yes",
+        "finish",
+        "complete",
+    }) do
+        if blob:find(word, 1, true) then
+            score += 20
+        end
+    end
+
+    return score
+end
+
+function InteractionService.ProcessDialogue(questName)
+    if not Config.AutoDialogue or not dialogueIsOpen() then
+        return false
+    end
+
+    local ui = dialogueUI()
+    local best
+    local bestScore = -math.huge
+
+    for _, object in ipairs(ui:GetDescendants()) do
+        if object:IsA("ImageButton") then
+            local score = scoreDialogueButton(object, questName or "")
+
+            if score and score > bestScore then
+                best = object
+                bestScore = score
+            end
+        end
+    end
+
+    if best then
+        return clickButton(best, false)
+    end
+
+    -- Fallback for games that temporarily reuse/reparent the NodeFrame template.
+    for _, object in ipairs(ui:GetDescendants()) do
+        if object:IsA("ImageButton") and isOnScreen(object) then
+            local parent = object.Parent
+            local blob = lower(
+                (parent and parent.Name or "")
+                .. " "
+                .. (parent and textOf(parent) or "")
+            )
+
+            if blob:find("quest", 1, true)
+                or blob:find("accept", 1, true)
+                or (
+                    questName
+                    and questName ~= ""
+                    and blob:find(lower(questName), 1, true)
+                ) then
+                return clickButton(object, false)
+            end
+        end
+    end
+
+    return false
+end
+
+function InteractionService.ProcessClaimButtons()
+    if not Config.AutoClaim then
+        return
+    end
+
+    for object in pairs(Runtime.ClaimButtons) do
+        if object and object.Parent then
+            if isGuiVisible(object) then
+                clickButton(object, false)
+                return
+            end
+        else
+            Runtime.ClaimButtons[object] = nil
+        end
+    end
+end
+
+function InteractionService.InteractWithQuestNPC(object, questName)
+    if not object then
+        return false
+    end
+
+    if dialogueIsOpen() then
+        return InteractionService.ProcessDialogue(questName)
+    end
+
+    if os.clock() - Runtime.LastInteraction < 0.75 then
+        return false
+    end
+
+    Runtime.LastInteraction = os.clock()
+
+    local prompt = object:IsA("ProximityPrompt")
+        and object
+        or InteractionService.FindPromptNear(object, "Dialogue")
+
+    if prompt then
+        InteractionService.FirePrompt(prompt)
+        return true
+    end
+
+    return false
 end
 
 -- ============================================================
--- CombatService
+-- Mastery / combat
 -- ============================================================
 
-local CombatService = {}
+MasteryService = {}
+
+local function currentFruitSkillNames()
+    local result = {}
+    local modules = ReplicatedStorage:FindFirstChild("Modules")
+    local skillInfo = modules and modules:FindFirstChild("SkillInformation")
+    local skills = skillInfo and skillInfo:FindFirstChild("Skills")
+    local fruits = skills and skills:FindFirstChild("Fruits")
+    local fruit = fruits and fruits:FindFirstChild(PlayerState.GetFruit())
+
+    if fruit then
+        for _, object in ipairs(fruit:GetDescendants()) do
+            if object:IsA("ModuleScript") then
+                result[lower(object.Name)] = true
+            end
+        end
+    end
+
+    return result
+end
+
+function MasteryService.GetCandidates()
+    HotbarService.Refresh()
+
+    local candidates = {}
+    local fruitSkills = Config.MasteryMode == "Current Fruit"
+        and currentFruitSkillNames()
+        or nil
+
+    for _, data in pairs(HotbarService.Slots) do
+        local accepted = false
+
+        if Config.MasteryMode == "Selected Skill" then
+            accepted = Config.SelectedWeapon ~= "Auto"
+                and data.Title == Config.SelectedWeapon
+        elseif Config.MasteryMode == "Current Fruit" then
+            local title = lower(data.Title)
+
+            if fruitSkills then
+                for skillName in pairs(fruitSkills) do
+                    if title == skillName
+                        or title:find(skillName, 1, true)
+                        or skillName:find(title, 1, true) then
+                        accepted = true
+                        break
+                    end
+                end
+            end
+        else
+            accepted = HotbarService.IsCombat(data)
+        end
+
+        if accepted
+            and (not Config.MasteryReadyOnly or HotbarService.IsReady(data)) then
+            table.insert(candidates, data)
+        end
+    end
+
+    table.sort(candidates, function(a, b)
+        return (tonumber(a.Slot) or 99) < (tonumber(b.Slot) or 99)
+    end)
+
+    return candidates
+end
+
+function MasteryService.Step()
+    if not Config.AutoMastery then
+        return false
+    end
+
+    local now = os.clock()
+    if now - Runtime.LastMastery < Config.MasteryInterval then
+        return false
+    end
+
+    local candidates = MasteryService.GetCandidates()
+    if #candidates == 0 then
+        return false
+    end
+
+    Runtime.LastMastery = now
+    Runtime.MasteryCursor = (Runtime.MasteryCursor % #candidates) + 1
+
+    return HotbarService.Press(candidates[Runtime.MasteryCursor])
+end
+
+function MasteryService.GetSnapshot()
+    local candidates = MasteryService.GetCandidates()
+    local rows = {}
+
+    for _, data in ipairs(candidates) do
+        local ready = HotbarService.IsReady(data) and "Ready" or "Cooldown"
+        local exp = data.EXP
+        local expText = ""
+
+        if exp and exp:IsA("GuiObject") then
+            local bar = exp:FindFirstChild("Bar", true)
+            if bar and bar:IsA("GuiObject") then
+                expText = string.format(
+                    " • EXP %.0f%%",
+                    math.clamp(bar.Size.X.Scale * 100, 0, 100)
+                )
+            end
+        end
+
+        table.insert(
+            rows,
+            data.Slot .. ": " .. data.Title .. " [" .. ready .. "]" .. expText
+        )
+    end
+
+    return #rows > 0 and table.concat(rows, "\n") or "No mastery candidates"
+end
+
+CombatService = {}
 
 local function setBlock(held)
     if Runtime.BlockHeld == held then
@@ -1543,72 +2392,42 @@ function CombatService.AimAt(model)
         return
     end
 
-    local ownRoot = rootPart()
-    local targetPart = objectRoot(model)
+    local root = rootPart()
+    local target = objectRoot(model)
 
-    if ownRoot and targetPart then
-        local position = ownRoot.Position
+    if root and target then
+        local position = root.Position
 
         pcall(function()
-            ownRoot.CFrame = CFrame.lookAt(
+            root.CFrame = CFrame.lookAt(
                 position,
-                Vector3.new(targetPart.Position.X, position.Y, targetPart.Position.Z)
+                Vector3.new(
+                    target.Position.X,
+                    position.Y,
+                    target.Position.Z
+                )
             )
         end)
     end
 end
 
-function CombatService.Attack()
+function CombatService.AttackStep()
     if not Config.AutoAttack then
         return
     end
 
+    MasteryService.Step()
+
     local now = os.clock()
-    local delay = 1 / math.max(1, Config.AttackRate)
+    local minimumDelay = 1 / math.max(1, Config.AttackRate)
 
-    if now - Runtime.LastAttack < delay then
-        return
-    end
-
-    Runtime.LastAttack = now
-
-    local selected = HotbarService.SelectConfigured()
-
-    local camera = Workspace.CurrentCamera
-    local size = camera and camera.ViewportSize or Vector2.new(800, 600)
-
-    pcall(function()
-        VirtualInputManager:SendMouseButtonEvent(
-            size.X / 2,
-            size.Y / 2,
-            0,
-            true,
-            game,
-            0
-        )
-
-        task.wait(0.02)
-
-        VirtualInputManager:SendMouseButtonEvent(
-            size.X / 2,
-            size.Y / 2,
-            0,
-            false,
-            game,
-            0
-        )
-    end)
-
-    if Config.AutoSkill
-        and selected
-        and now - Runtime.LastSkill >= Config.AutoSkillDelay then
-
-        Runtime.LastSkill = now
-        HotbarService.Press(selected)
+    if now - Runtime.LastAttack >= minimumDelay then
+        Runtime.LastAttack = now
+        mouseClickCenter()
     end
 end
 
-function CombatService.UpdateBlock()
+function CombatService.BlockStep()
     if not Config.AutoBlock then
         setBlock(false)
         return
@@ -1617,291 +2436,247 @@ function CombatService.UpdateBlock()
     local target = Runtime.CurrentTarget
     local shouldBlock = target
         and target.Parent
-        and distanceTo(target) <= 20
+        and distanceTo(target) <= 25
         and PlayerState.GetHealthPercent() <= Config.BlockHealthPercent
 
     setBlock(shouldBlock == true)
 end
 
 -- ============================================================
--- Quest automation helpers
+-- Stats service
 -- ============================================================
 
-local function findQuestEntity(targetName)
-    return TargetService.Find(targetName)
+StatsService = {}
+
+local STAT_NAMES = {
+    "Health",
+    "Strength",
+    "Energy",
+    "Willpower",
+    "Agility",
+    "Precision",
+}
+
+local STAT_WEIGHTS = {
+    ["Balanced"] = {
+        Health = 1,
+        Strength = 1,
+        Energy = 1,
+        Willpower = 1,
+        Agility = 1,
+        Precision = 1,
+    },
+    ["Strength"] = {
+        Health = 1.4,
+        Strength = 4.5,
+        Energy = 1.3,
+        Willpower = 1.0,
+        Agility = 1.0,
+        Precision = 0.1,
+    },
+    ["Precision"] = {
+        Health = 1.4,
+        Strength = 0.1,
+        Energy = 1.3,
+        Willpower = 1.0,
+        Agility = 1.0,
+        Precision = 4.5,
+    },
+    ["Tank"] = {
+        Health = 5.0,
+        Strength = 0.8,
+        Energy = 1.3,
+        Willpower = 2.3,
+        Agility = 0.8,
+        Precision = 0.8,
+    },
+    ["Mobility"] = {
+        Health = 1.4,
+        Strength = 1.0,
+        Energy = 2.0,
+        Willpower = 1.0,
+        Agility = 4.0,
+        Precision = 1.0,
+    },
+    ["Haki"] = {
+        Health = 1.5,
+        Strength = 1.0,
+        Energy = 1.4,
+        Willpower = 4.5,
+        Agility = 1.0,
+        Precision = 1.0,
+    },
+}
+
+local function radarFrame()
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local menu = playerGui and playerGui:FindFirstChild("Menu")
+    local container = menu and menu:FindFirstChild("ContainerFrame")
+    local right = container and container:FindFirstChild("Right")
+    return right and right:FindFirstChild("Radar")
 end
 
-local function moveAndInteract(object, stateName, detail, promptType)
-    if not object then
-        Runtime.WorkerState = "Searching"
-        Runtime.WorkerDetail = detail
+function StatsService.GetStatPoints()
+    local radar = radarFrame()
+    local statpoint = radar and radar:FindFirstChild("StatpointText")
+    local label = statpoint and statpoint:FindFirstChild("StatpointText")
+
+    if label and label:IsA("TextLabel") then
+        return tonumber(label.Text:match("(%d+)")) or 0
+    end
+
+    return 0
+end
+
+function StatsService.GetValues()
+    local radar = radarFrame()
+    local statsFolder = radar and radar:FindFirstChild("Stats")
+    local values = {}
+
+    for _, name in ipairs(STAT_NAMES) do
+        local value = statsFolder and statsFolder:FindFirstChild(name)
+
+        if value and (value:IsA("IntValue") or value:IsA("NumberValue")) then
+            values[name] = tonumber(value.Value) or 0
+        else
+            local label = radar
+                and radar:FindFirstChild(name)
+                and radar[name]:FindFirstChild("Number")
+
+            values[name] = label
+                and tonumber((label.Text or ""):match("(%d+)"))
+                or 0
+        end
+    end
+
+    return values
+end
+
+local function autoWeaponBuild()
+    local selected = HotbarService.ResolveConfigured()
+
+    local blob = lower(
+        Config.SelectedWeapon
+        .. " "
+        .. tostring(selected and selected.Title or "")
+        .. " "
+        .. table.concat(PlayerState.GetWeaponTypes(), " ")
+        .. " "
+        .. PlayerState.GetFruit()
+    )
+
+    if blob:find("gun", 1, true)
+        or blob:find("cannon", 1, true)
+        or blob:find("precision", 1, true)
+        or blob:find("rifle", 1, true)
+        or blob:find("shot", 1, true) then
+        return "Precision"
+    end
+
+    return "Strength"
+end
+
+function StatsService.GetBuild()
+    if Config.StatBuild == "Auto Weapon" then
+        return autoWeaponBuild()
+    end
+
+    return Config.StatBuild
+end
+
+function StatsService.ChooseStat()
+    local build = StatsService.GetBuild()
+    local weights = STAT_WEIGHTS[build] or STAT_WEIGHTS.Balanced
+    local values = StatsService.GetValues()
+
+    local totalWeight = 0
+    local totalValue = 0
+
+    for _, name in ipairs(STAT_NAMES) do
+        totalWeight += weights[name] or 0
+        totalValue += values[name] or 0
+    end
+
+    local best
+    local bestDeficit = -math.huge
+
+    for _, name in ipairs(STAT_NAMES) do
+        local weight = weights[name] or 0
+        local target = totalWeight > 0
+            and ((totalValue + 1) * weight / totalWeight)
+            or 0
+
+        local deficit = target - (values[name] or 0)
+
+        if deficit > bestDeficit then
+            best = name
+            bestDeficit = deficit
+        end
+    end
+
+    return best
+end
+
+function StatsService.SpendOne()
+    if not Config.AutoStats then
         return false
     end
 
-    Runtime.CurrentTarget = object
-    Runtime.CurrentTargetReason = detail
-
-    if distanceTo(object) > Config.ArrivalDistance then
-        TweenController.MoveTo(object)
-        Runtime.WorkerState = "Tweening"
-        Runtime.WorkerDetail = detail
+    local now = os.clock()
+    if now - Runtime.LastStatsSpend < Config.StatSpendInterval then
         return false
     end
 
-    TweenController.Cancel()
-    Runtime.WorkerState = stateName
-    Runtime.WorkerDetail = detail
-
-    local prompt = InteractionService.FindPromptNear(object, promptType)
-        or InteractionService.FindPromptByText(detail)
-
-    if prompt then
-        InteractionService.FirePrompt(prompt)
-    end
-
-    return true
-end
-
-local function handleQuestNonCombat()
-    if not Config.AutoQuest then
+    if StatsService.GetStatPoints() <= 0 then
         return false
     end
 
-    local completed = QuestService.GetCompletedQuest()
+    local stat = StatsService.ChooseStat()
+    local radar = radarFrame()
+    local frame = radar and radar:FindFirstChild(stat or "")
+    local button = frame and frame:FindFirstChild("ImageButton")
 
-    if completed and Config.AutoTurnIn then
-        local npc = QuestService.FindDialogueNPC(completed.Name)
-
-        if moveAndInteract(
-            npc,
-            "Quest Turn In",
-            completed.Name,
-            "Dialogue"
-        ) then
-            InteractionService.ProcessDialogue()
-        end
-
-        return true
+    if not button or not button:IsA("ImageButton") then
+        return false
     end
 
-    local quest, taskData = QuestService.GetNextTask()
+    Runtime.LastStatsSpend = now
+    return clickButton(button, true)
+end
 
-    if quest and taskData and taskData.Kind ~= "Defeat" then
-        if taskData.Kind == "Talk"
-            or taskData.Kind == "Return"
-            or taskData.Kind == "Deliver" then
+function StatsService.GetSnapshot()
+    local values = StatsService.GetValues()
+    local rows = {
+        "Points: " .. StatsService.GetStatPoints(),
+        "Build: " .. StatsService.GetBuild(),
+    }
 
-            local npc = QuestService.FindDialogueNPC(quest.Name, taskData.Target)
-                or TargetService.Find(taskData.Target)
-
-            if moveAndInteract(
-                npc,
-                "Quest Dialogue",
-                taskData.Target,
-                "Dialogue"
-            ) then
-                InteractionService.ProcessDialogue()
-            end
-
-            return true
-        end
-
-        if taskData.Kind == "Collect" or taskData.Kind == "Find" then
-            local prompt = InteractionService.FindPromptByText(taskData.Target)
-
-            if prompt then
-                if distanceTo(prompt) > Config.ArrivalDistance then
-                    Runtime.CurrentTarget = prompt
-                    Runtime.CurrentTargetReason = taskData.Text
-                    TweenController.MoveTo(prompt)
-                else
-                    TweenController.Cancel()
-                    InteractionService.FirePrompt(prompt)
-                end
-            else
-                local target = TargetService.Find(taskData.Target)
-                moveAndInteract(target, "Quest Collect", taskData.Target)
-            end
-
-            return true
-        end
-
-        local prompt = InteractionService.FindPromptByText(taskData.Target)
-        local target = prompt or TargetService.Find(taskData.Target)
-
-        if target then
-            if distanceTo(target) > Config.ArrivalDistance then
-                Runtime.CurrentTarget = target
-                Runtime.CurrentTargetReason = taskData.Text
-                TweenController.MoveTo(target)
-            elseif prompt then
-                InteractionService.FirePrompt(prompt)
-            end
-        end
-
-        return true
+    for _, name in ipairs(STAT_NAMES) do
+        table.insert(rows, name .. ": " .. tostring(values[name] or 0))
     end
 
-    if not quest then
-        local recommended = QuestService.GetRecommended()
-
-        if recommended and Config.AutoAcceptRecommended then
-            local npc = QuestService.FindDialogueNPC(recommended.Name)
-
-            if moveAndInteract(
-                npc,
-                "Accept Quest",
-                recommended.Name,
-                "Dialogue"
-            ) then
-                InteractionService.ProcessDialogue()
-            end
-
-            return true
-        end
-    end
-
-    return false
+    return table.concat(rows, "\n")
 end
 
 -- ============================================================
--- FarmService
+-- Fishing service + QTE
 -- ============================================================
 
-local FarmService = {}
+FishingService = {}
 
-function FarmService.ResolveWanted()
-    if Config.FarmMode == "Boss" or Config.AutoBoss then
-        return "Boss Only", "Boss"
-    end
+local ROD_NAMES = {
+    "Wooden Rod",
+    "Carbon Rod",
+    "Fiberglass Rod",
+    "Silverline Rod",
+    "Deep-Sea Rod",
+    "Terry's Trusted Rod",
+    "Celestial Rod",
+}
 
-    if Config.FarmMode == "Selected Mob" then
-        return Config.SelectedMob, "Selected Mob"
-    end
-
-    local quest, taskData = QuestService.GetNextTask()
-
-    if quest and taskData and taskData.Kind == "Defeat" then
-        return taskData.Target, "Quest: " .. quest.Name
-    end
-
-    return Config.SelectedMob, "Fallback"
-end
-
-function FarmService.Step()
-    if not Config.AutoFarm then
-        if Runtime.CurrentTargetReason and Runtime.CurrentTargetReason:find("Farm", 1, true) then
-            Runtime.CurrentTarget = nil
-            Runtime.CurrentTargetReason = nil
-        end
-
-        return
-    end
-
-    if not PlayerState.IsReady() then
-        Runtime.WorkerState = "Waiting"
-        Runtime.WorkerDetail = "Player data loading"
-        return
-    end
-
-    if Config.FarmMode == "Smart Quest" and handleQuestNonCombat() then
-        return
-    end
-
-    local wanted, reason = FarmService.ResolveWanted()
-    local target = TargetService.Find(wanted)
-
-    if not target then
-        Runtime.CurrentTarget = nil
-        Runtime.WorkerState = "Searching"
-        Runtime.WorkerDetail = wanted
-        return
-    end
-
-    Runtime.CurrentTarget = target
-    Runtime.CurrentTargetReason = "Farm • " .. reason
-
-    BringService.Step(wanted)
-
-    if distanceTo(target) > Config.CombatDistance then
-        TweenController.MoveTo(target, Config.FarmHeight, Config.FarmBack)
-        Runtime.WorkerState = "Tweening"
-        Runtime.WorkerDetail = wanted
-        return
-    end
-
-    TweenController.Cancel()
-    Runtime.WorkerState = "Farming"
-    Runtime.WorkerDetail = wanted
-
-    CombatService.AimAt(target)
-    CombatService.Attack()
-end
-
--- ============================================================
--- LifeSkillService / collection
--- ============================================================
-
-local LifeSkillService = {}
-
-local function manualPromptEnabled(kind)
-    return kind == "Pickup" and Config.AutoPickup
-        or kind == "Chest" and Config.AutoChest
-        or kind == "WorldBossChest" and Config.AutoWorldBossChest
-        or kind == "FruitChest" and Config.AutoFruitChest
-        or kind == "QuestItem" and Config.AutoQuestItems
-        or kind == "Ore" and Config.AutoMining
-        or kind == "Farm" and Config.AutoFarming
-end
-
-function LifeSkillService.ProcessPrompts()
-    if Config.AutoFarm then
-        -- Farm owns movement. Only collect close prompts while farming.
-        local prompt = InteractionService.FindNearestPrompt(function(_, kind)
-            return manualPromptEnabled(kind)
-        end, 12)
-
-        if prompt then
-            InteractionService.FirePrompt(prompt)
-        end
-
-        return
-    end
-
-    local prompt = InteractionService.FindNearestPrompt(function(_, kind)
-        return manualPromptEnabled(kind)
-    end)
-
-    if not prompt then
-        return
-    end
-
-    if promptKind(prompt) == "Ore" then
-        local pickaxe = HotbarService.TitleToSlot["Rusty Pickaxe"]
-
-        if not pickaxe then
-            for title, data in pairs(HotbarService.TitleToSlot) do
-                if lower(title):find("pickaxe", 1, true) then
-                    pickaxe = data
-                    break
-                end
-            end
-        end
-
-        if pickaxe then
-            HotbarService.Press(pickaxe)
-        end
-    end
-
-    Runtime.CurrentTarget = prompt
-    Runtime.CurrentTargetReason = "Lifeskill • " .. promptKind(prompt)
-
-    if distanceTo(prompt) > Config.ArrivalDistance then
-        TweenController.MoveTo(prompt, 2.5, 2)
-    else
-        TweenController.Cancel()
-        InteractionService.FirePrompt(prompt)
-    end
+local function fishInventory()
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    return playerGui and playerGui:FindFirstChild("FishInventory")
 end
 
 local function fishingGui()
@@ -1909,89 +2684,1374 @@ local function fishingGui()
     return playerGui and playerGui:FindFirstChild("Fishing")
 end
 
-function LifeSkillService.ProcessFishing()
-    if not Config.AutoFishing or Config.AutoFarm then
-        return
-    end
-
-    local gui = fishingGui()
-    local main = gui and gui:FindFirstChild("Main")
-    local active = gui
-        and (not gui:IsA("ScreenGui") or gui.Enabled)
-        and main
-        and main.Visible
-
-    local rod
-
-    for title, data in pairs(HotbarService.TitleToSlot) do
-        if lower(title):find("rod", 1, true) then
-            rod = data
-            break
-        end
-    end
-
-    if active then
-        local move = main:FindFirstChild("Move")
-        local fish = main:FindFirstChild("Fish")
-
-        if move and fish
-            and move:IsA("GuiObject")
-            and fish:IsA("GuiObject") then
-
-            local moveX = move.AbsolutePosition.X + move.AbsoluteSize.X / 2
-            local fishX = fish.AbsolutePosition.X + fish.AbsoluteSize.X / 2
-            local delta = fishX - moveX
-
-            if math.abs(delta) > 15 then
-                local key = delta > 0 and Enum.KeyCode.D or Enum.KeyCode.A
-
-                pcall(function()
-                    VirtualInputManager:SendKeyEvent(true, key, false, game)
-                    task.wait(0.03)
-                    VirtualInputManager:SendKeyEvent(false, key, false, game)
-                end)
-            end
-        end
-
-        return
-    end
-
-    if rod and os.clock() - Runtime.LastFishingCast > 3 then
-        Runtime.LastFishingCast = os.clock()
-        HotbarService.Press(rod)
-    end
+local function qteScreen()
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    return playerGui and playerGui:FindFirstChild("QuickTimeEvents")
 end
 
-function LifeSkillService.TweenNearestDigSpot()
-    local islands = Workspace:FindFirstChild("Islands")
-    local ownRoot = rootPart()
+local function setFishingState(state, reason)
+    if Runtime.FishingState ~= state then
+        Runtime.FishingState = state
+        Runtime.FishingStateSince = os.clock()
+    end
 
-    if not islands or not ownRoot then
+    Runtime.FishingReason = reason or Runtime.FishingReason
+end
+
+local function setFishingMouseHeld(held)
+    if Runtime.FishingMouseHeld == held then
         return
+    end
+
+    Runtime.FishingMouseHeld = held
+
+    local camera = Workspace.CurrentCamera
+    local viewport = camera and camera.ViewportSize or Vector2.new(800, 600)
+
+    pcall(function()
+        VirtualInputManager:SendMouseButtonEvent(
+            viewport.X / 2,
+            viewport.Y / 2,
+            0,
+            held,
+            game,
+            0
+        )
+    end)
+end
+
+local function releaseFishingKey()
+    if not Runtime.FishingKeyHeld then
+        return
+    end
+
+    local key = Runtime.FishingKeyHeld
+    Runtime.FishingKeyHeld = nil
+
+    pcall(function()
+        VirtualInputManager:SendKeyEvent(false, key, false, game)
+    end)
+end
+
+local function holdFishingKey(key)
+    if Runtime.FishingKeyHeld == key then
+        return
+    end
+
+    releaseFishingKey()
+    Runtime.FishingKeyHeld = key
+
+    pcall(function()
+        VirtualInputManager:SendKeyEvent(true, key, false, game)
+    end)
+end
+
+local function findHotbarRod()
+    HotbarService.Refresh()
+
+    for _, data in pairs(HotbarService.Slots) do
+        local value = lower(data.Title)
+
+        if value:find("rod", 1, true) then
+            return {
+                Name = data.Title,
+                Source = "Hotbar",
+                Hotbar = data,
+            }
+        end
+    end
+
+    return nil
+end
+
+local function findInventoryRod()
+    local inventory = fishInventory()
+    local root = inventory
+        and inventory:FindFirstChild("Inventory")
+        and inventory.Inventory:FindFirstChild("Inventory")
+
+    local rodFrame = root and root:FindFirstChild("RodFrame")
+    local inner = rodFrame and rodFrame:FindFirstChild("Frame")
+    local itemName = inner and inner:FindFirstChild("ItemName")
+    local equip = inner and inner:FindFirstChild("Equip")
+
+    if itemName and itemName:IsA("TextLabel") then
+        local name = normalize(itemName.Text):gsub("^%[", ""):gsub("%]$", "")
+
+        return {
+            Name = name,
+            Source = "FishInventory",
+            EquipButton = equip,
+        }
+    end
+
+    return nil
+end
+
+function FishingService.FindRod()
+    local now = os.clock()
+
+    if Runtime.FishingRodCache
+        and now - Runtime.FishingRodCacheAt < 1.0 then
+        return Runtime.FishingRodCache
+    end
+
+    Runtime.FishingRodCacheAt = now
+    Runtime.FishingRodCache = findHotbarRod() or findInventoryRod()
+    return Runtime.FishingRodCache
+end
+
+function FishingService.GetBait()
+    local now = os.clock()
+
+    if Runtime.FishingBaitCache
+        and now - Runtime.FishingBaitCacheAt < 1.5 then
+        return Runtime.FishingBaitCache
+    end
+
+    Runtime.FishingBaitCacheAt = now
+
+    local inventory = fishInventory()
+    local root = inventory
+        and inventory:FindFirstChild("Inventory")
+        and inventory.Inventory:FindFirstChild("Inventory")
+
+    local baitFrame = root and root:FindFirstChild("BaitFrame")
+    local inner = baitFrame and baitFrame:FindFirstChild("Frame")
+    local itemName = inner and inner:FindFirstChild("ItemName")
+    local amount = inner and inner:FindFirstChild("Amount")
+
+    if itemName and itemName:IsA("TextLabel") then
+        local count = amount
+            and amount:IsA("TextLabel")
+            and tonumber((amount.Text or ""):match("(%d+)"))
+            or 0
+
+        Runtime.FishingBaitCache = {
+            Name = normalize(itemName.Text):gsub("^%[", ""):gsub("%]$", ""),
+            Amount = count or 0,
+        }
+
+        return Runtime.FishingBaitCache
+    end
+
+    Runtime.FishingBaitCache = nil
+    return nil
+end
+
+local function largestAnchorTownWater()
+    local islands = Workspace:FindFirstChild("Islands")
+    local anchor = islands and islands:FindFirstChild("Anchor Town")
+    if not anchor then
+        return nil
     end
 
     local best
-    local bestDistance
+    local bestArea = 0
 
-    for _, descendant in ipairs(islands:GetDescendants()) do
-        if descendant:IsA("BasePart")
-            and descendant.Parent
-            and descendant.Parent.Name == "DigSpots" then
-
-            local distance = (ownRoot.Position - descendant.Position).Magnitude
-
-            if not bestDistance or distance < bestDistance then
-                best = descendant
-                bestDistance = distance
+    for _, object in ipairs(anchor:GetDescendants()) do
+        if object:IsA("BasePart") and object.Name == "Water" then
+            local area = object.Size.X * object.Size.Z
+            if area > bestArea then
+                best = object
+                bestArea = area
             end
         end
     end
 
-    if best then
-        TweenController.MoveTo(best, 3, 0)
-    else
-        notify("Treasure", "Không tìm thấy DigSpot client-visible.", 3)
+    return best
+end
+
+local function shorePosition(water)
+    local root = rootPart()
+    if not water or not root then
+        return nil
     end
+
+    local localPos = water.CFrame:PointToObjectSpace(root.Position)
+    local halfX = water.Size.X / 2
+    local halfZ = water.Size.Z / 2
+    local margin = 7
+
+    local edges = {
+        {math.abs(localPos.X + halfX), "left"},
+        {math.abs(halfX - localPos.X), "right"},
+        {math.abs(localPos.Z + halfZ), "back"},
+        {math.abs(halfZ - localPos.Z), "front"},
+    }
+
+    table.sort(edges, function(a, b)
+        return a[1] < b[1]
+    end)
+
+    local x = math.clamp(localPos.X, -halfX, halfX)
+    local z = math.clamp(localPos.Z, -halfZ, halfZ)
+
+    if edges[1][2] == "left" then
+        x = -halfX - margin
+    elseif edges[1][2] == "right" then
+        x = halfX + margin
+    elseif edges[1][2] == "back" then
+        z = -halfZ - margin
+    else
+        z = halfZ + margin
+    end
+
+    local world = water.CFrame:PointToWorldSpace(Vector3.new(
+        x,
+        water.Size.Y / 2 + 3,
+        z
+    ))
+
+    return CFrame.lookAt(world, water.Position)
+end
+
+function FishingService.ResolveSpot()
+    if Config.FishingSpotMode == "Saved Position" then
+        return Runtime.FishingSpotCFrame,
+            Runtime.FishingSpotCFrame and "Saved position" or "No saved spot"
+    elseif Config.FishingSpotMode == "Current Position" then
+        local root = rootPart()
+        return root and root.CFrame or nil,
+            root and "Current position" or "Character unavailable"
+    elseif Config.FishingSpotMode == "Anchor Town Pond" then
+        local water = largestAnchorTownWater()
+        return water and shorePosition(water) or nil,
+            water and "Detected Anchor Town water edge" or "Anchor Town water not found"
+    end
+
+    return nil, "Unknown spot mode"
+end
+
+local function fishingReelActive()
+    local gui = fishingGui()
+    local main = gui and gui:FindFirstChild("Main")
+
+    return gui
+        and (not gui:IsA("ScreenGui") or gui.Enabled)
+        and main
+        and main.Visible,
+        main
+end
+
+local function qteButtonByText(text)
+    local screen = qteScreen()
+    if not screen or not screen.Enabled then
+        return nil
+    end
+
+    local wanted = lower(text)
+
+    for _, object in ipairs(screen:GetDescendants()) do
+        if object:IsA("ImageButton")
+            and not isScriptTemplateDescendant(object)
+            and isOnScreen(object) then
+
+            local label = object:FindFirstChildWhichIsA("TextLabel", true)
+            if label and lower(label.Text) == wanted then
+                return object
+            end
+        end
+    end
+
+    -- Some QTE implementations may reuse the template in place.
+    -- In the inactive dump, those template buttons sit at Y=-58;
+    -- only accept a template if it has moved into the viewport.
+    for _, object in ipairs(screen:GetDescendants()) do
+        if object:IsA("ImageButton") and isOnScreen(object) then
+            local label = object:FindFirstChildWhichIsA("TextLabel", true)
+            if label and lower(label.Text) == wanted then
+                return object
+            end
+        end
+    end
+
+    return nil
+end
+
+local function findEnabledBillboard(name)
+    local screen = qteScreen()
+    if not screen then
+        return nil
+    end
+
+    for _, object in ipairs(screen:GetDescendants()) do
+        if object:IsA("BillboardGui")
+            and object.Name == name
+            and object.Enabled then
+            return object
+        end
+    end
+
+    return nil
+end
+
+function FishingService.HandleShake()
+    if not Config.FishingAutoShake then
+        return false
+    end
+
+    local button = qteButtonByText("SHAKE")
+    if not button then
+        return false
+    end
+
+    local now = os.clock()
+    local position = button.AbsolutePosition
+
+    local moved = not Runtime.FishingLastShakePosition
+        or (Runtime.FishingLastShakePosition - position).Magnitude > 3
+
+    if moved or now - Runtime.FishingLastShakeClick >= 0.12 then
+        Runtime.FishingLastShakePosition = position
+        Runtime.FishingLastShakeClick = now
+        clickButton(button, false)
+    end
+
+    setFishingState("SHAKE", "Clicking SHAKE QTE")
+    return true
+end
+
+function FishingService.HandleSpamClick()
+    if not Config.FishingAutoSpamClick then
+        return false
+    end
+
+    local button = qteButtonByText("CLICK")
+    if not button then
+        return false
+    end
+
+    local now = os.clock()
+    if now - Runtime.FishingLastSpamClick >= 0.065 then
+        Runtime.FishingLastSpamClick = now
+        clickButton(button, false)
+    end
+
+    setFishingState("SPAM_CLICK", "Handling CLICK QTE")
+    return true
+end
+
+function FishingService.HandleTimedRelease()
+    if not Config.FishingAutoTimedRelease then
+        Runtime.FishingTimedReleaseDone = false
+        setFishingMouseHeld(false)
+        return false
+    end
+
+    local bar = findEnabledBillboard("Fishing Bar")
+    if not bar then
+        Runtime.FishingTimedReleaseDone = false
+        setFishingMouseHeld(false)
+        return false
+    end
+
+    local frame = bar:FindFirstChild("Frame")
+    local amount = frame and frame:FindFirstChild("Amount")
+
+    if not amount or not amount:IsA("GuiObject") then
+        return false
+    end
+
+    if Runtime.FishingTimedReleaseDone then
+        setFishingMouseHeld(false)
+        setFishingState("TIMED_RELEASE", "Release completed")
+        return true
+    end
+
+    local fill = math.clamp(amount.Size.Y.Scale, 0, 1)
+
+    if fill < Config.FishingReleaseThreshold then
+        setFishingMouseHeld(true)
+        setFishingState(
+            "TIMED_RELEASE",
+            string.format("Holding %.0f%%", fill * 100)
+        )
+    else
+        setFishingMouseHeld(false)
+        Runtime.FishingTimedReleaseDone = true
+        setFishingState(
+            "TIMED_RELEASE",
+            string.format("Released %.0f%%", fill * 100)
+        )
+    end
+
+    return true
+end
+
+function FishingService.HandleReel()
+    local active, main = fishingReelActive()
+    if not active or not main then
+        releaseFishingKey()
+        setFishingMouseHeld(false)
+        Runtime.FishingReelCalibrated = false
+        Runtime.FishingLastMoveCenter = nil
+        return false
+    end
+
+    local move = main:FindFirstChild("Move")
+    local fish = main:FindFirstChild("Fish")
+
+    if not move or not fish
+        or not move:IsA("GuiObject")
+        or not fish:IsA("GuiObject") then
+        return false
+    end
+
+    -- Confirmed from the dump:
+    -- Move = the wide controllable catcher bar.
+    -- Fish = the smaller target block that must stay inside Move.
+    local moveLeft = move.AbsolutePosition.X
+    local moveRight = moveLeft + move.AbsoluteSize.X
+    local moveCenter = moveLeft + move.AbsoluteSize.X / 2
+
+    local fishLeft = fish.AbsolutePosition.X
+    local fishRight = fishLeft + fish.AbsoluteSize.X
+    local fishCenter = fishLeft + fish.AbsoluteSize.X / 2
+
+    local previousCenter = Runtime.FishingLastMoveCenter
+    if previousCenter then
+        Runtime.FishingLastMoveVelocity = moveCenter - previousCenter
+    end
+    Runtime.FishingLastMoveCenter = moveCenter
+
+    -- Optional one-time calibration. We briefly hold and observe whether Move
+    -- travels right or left. This avoids hard-coding the input direction.
+    if Config.FishingAutoCalibrate and not Runtime.FishingReelCalibrated then
+        local before = moveCenter
+        setFishingMouseHeld(true)
+        task.wait(0.075)
+
+        local after = move.AbsolutePosition.X + move.AbsoluteSize.X / 2
+        local delta = after - before
+
+        if math.abs(delta) >= 0.5 then
+            Runtime.FishingHoldDirection = delta > 0 and 1 or -1
+        else
+            Runtime.FishingHoldDirection = Config.FishingHoldMovesRight and 1 or -1
+        end
+
+        Runtime.FishingReelCalibrated = true
+        Runtime.FishingLastMoveCenter = after
+        setFishingMouseHeld(false)
+        return true
+    end
+
+    local tolerance = Config.FishingReelTolerance
+    local innerLeft = moveLeft + tolerance
+    local innerRight = moveRight - tolerance
+
+    -- Target control direction:
+    -- +1 = Move should travel right, -1 = Move should travel left.
+    local wantedDirection = 0
+
+    if fishRight > innerRight then
+        wantedDirection = 1
+    elseif fishLeft < innerLeft then
+        wantedDirection = -1
+    else
+        -- Fish is already contained. Counter the current bar velocity so it
+        -- does not drift out of the target while we wait for the next frame.
+        local velocity = Runtime.FishingLastMoveVelocity or 0
+        if velocity > 0.6 and fishCenter <= moveCenter + tolerance then
+            wantedDirection = -1
+        elseif velocity < -0.6 and fishCenter >= moveCenter - tolerance then
+            wantedDirection = 1
+        else
+            wantedDirection = fishCenter > moveCenter and 1 or -1
+        end
+    end
+
+    local holdDirection = Runtime.FishingHoldDirection or 1
+    local shouldHold = wantedDirection == holdDirection
+    setFishingMouseHeld(shouldHold)
+    releaseFishingKey()
+
+    Runtime.FishingHadReel = true
+    setFishingState(
+        "REEL",
+        string.format(
+            "Keeping Fish inside Move | error %.1f | %s",
+            fishCenter - moveCenter,
+            shouldHold and "HOLD" or "RELEASE"
+        )
+    )
+
+    return true
+end
+
+function FishingService.EquipRod(rod)
+    if not rod then
+        return false
+    end
+
+    if rod.Source == "Hotbar" then
+        return HotbarService.Press(rod.Hotbar)
+    end
+
+    if rod.EquipButton and rod.EquipButton:IsA("GuiButton") then
+        local ok = clickButton(rod.EquipButton, true)
+
+        if ok then
+            Runtime.FishingRodCache = nil
+            Runtime.FishingRodCacheAt = 0
+        end
+
+        return ok
+    end
+
+    return false
+end
+
+function FishingService.GetConditions()
+    local rod = FishingService.FindRod()
+    local bait = FishingService.GetBait()
+    local spot, spotReason = FishingService.ResolveSpot()
+
+    return {
+        Enabled = Config.AutoFishing,
+        PlayerReady = PlayerState.IsReady(),
+        ProgressionFree = not Config.AutoProgress
+            or Runtime.ProgressLifeSkill == "Fishing",
+        Rod = rod and rod.Name or "None",
+        RodSource = rod and rod.Source or "None",
+        Bait = bait and bait.Name or "None",
+        BaitAmount = bait and bait.Amount or 0,
+        BaitRequired = Config.FishingRequireBait,
+        SpotFound = spot ~= nil,
+        Spot = spotReason,
+        State = Runtime.FishingState,
+        Reason = Runtime.FishingReason,
+        CanStart =
+            Config.AutoFishing
+            and PlayerState.IsReady()
+            and (
+                not Config.AutoProgress
+                or Runtime.ProgressLifeSkill == "Fishing"
+            )
+            and rod ~= nil
+            and spot ~= nil
+            and (
+                not Config.FishingRequireBait
+                or (bait and bait.Amount > 0)
+            ),
+    }
+end
+
+function FishingService.Reset(reason)
+    releaseFishingKey()
+    setFishingMouseHeld(false)
+    Runtime.FishingHadReel = false
+    Runtime.FishingTimedReleaseDone = false
+    Runtime.FishingLastShakePosition = nil
+    setFishingState("CHECK", reason or "reset")
+end
+
+function FishingService.Step()
+    local progressionFishing = Config.AutoProgress
+        and Runtime.ProgressLifeSkill == "Fishing"
+
+    if not Config.AutoFishing and not progressionFishing then
+        FishingService.Reset("Auto Fishing disabled")
+        setFishingState("IDLE", "Auto Fishing disabled")
+        return 0.8
+    end
+
+    if Config.AutoProgress
+        and Runtime.ProgressLifeSkill ~= "Fishing" then
+        FishingService.Reset("Auto Progress owns movement")
+        return 0.6
+    end
+
+    if not PlayerState.IsReady() then
+        FishingService.Reset("Player not ready")
+        return 0.8
+    end
+
+    -- QTE priority comes before inventory/hotbar checks so a 30-60 Hz QTE
+    -- never performs expensive hotbar/inventory discovery every frame.
+    if FishingService.HandleShake() then
+        return 0.045
+    end
+
+    if FishingService.HandleSpamClick() then
+        return 0.055
+    end
+
+    if FishingService.HandleTimedRelease() then
+        return 0.035
+    end
+
+    if FishingService.HandleReel() then
+        return 0.035
+    end
+
+    releaseFishingKey()
+    setFishingMouseHeld(false)
+
+    local rod = FishingService.FindRod()
+    if not rod then
+        FishingService.Reset("No fishing rod detected")
+        setFishingState("MISSING_ROD", "No rod in Hotbar/FishInventory")
+        return 1.0
+    end
+
+    local bait = FishingService.GetBait()
+    if Config.FishingRequireBait
+        and (not bait or bait.Amount <= 0) then
+
+        FishingService.Reset("Required bait missing")
+        setFishingState("MISSING_BAIT", "Bait required but unavailable")
+        return 1.0
+    end
+
+    local spot, spotReason = FishingService.ResolveSpot()
+    if not spot then
+        FishingService.Reset(spotReason)
+        setFishingState("MISSING_SPOT", spotReason)
+        return 1.0
+    end
+
+    if Runtime.FishingHadReel then
+        Runtime.FishingHadReel = false
+        Runtime.FishingLastCast = os.clock()
+        setFishingState("COOLDOWN", "Reel ended")
+    end
+
+    if Runtime.FishingState == "COOLDOWN" then
+        if os.clock() - Runtime.FishingStateSince < Config.FishingCooldown then
+            return 0.25
+        end
+
+        setFishingState("CHECK", "Cooldown complete")
+    end
+
+    local root = rootPart()
+    local distance = root and (root.Position - spot.Position).Magnitude or math.huge
+
+    if distance > Config.PlatformArrivalDistance then
+        if not Config.FishingAutoReturn then
+            setFishingState("WAIT_SPOT", "Move to fishing spot manually")
+            return 0.8
+        end
+
+        setFishingState("MOVE_TO_SPOT", spotReason)
+        PlatformTransport.MoveToRootCFrame(spot)
+        return 0.20
+    end
+
+    PlatformTransport.Cancel(true)
+
+    if Runtime.FishingState == "WAIT_QTE" then
+        if os.clock() - Runtime.FishingStateSince >= Config.FishingBiteTimeout then
+            Runtime.FishingLastCast = os.clock()
+            setFishingState("COOLDOWN", "No bite/QTE; retrying")
+        end
+
+        return 0.25
+    end
+
+    if os.clock() - Runtime.FishingLastCast < Config.FishingCooldown then
+        return 0.25
+    end
+
+    FishingService.EquipRod(rod)
+    task.wait(0.08)
+    mouseClickCenter()
+
+    Runtime.FishingLastCast = os.clock()
+    setFishingState("WAIT_QTE", "Cast once; waiting for SHAKE/QTE")
+
+    return 0.20
+end
+
+-- ============================================================
+-- Mining service
+-- Real ore models + verified hold/release QTE
+-- ============================================================
+
+MiningQTEService = {}
+
+local ORE_CATALOG = {
+    "Copper Ore",
+    "Iron Ore",
+    "Silver Ore",
+    "Gold Ore",
+    "Diamond Ore",
+}
+
+local function setMiningState(state, reason)
+    if Runtime.MiningState ~= state then
+        Runtime.MiningState = state
+        Runtime.MiningStateSince = os.clock()
+    end
+    Runtime.ProgressDetail = reason or Runtime.ProgressDetail
+end
+
+local function miningMouse(held, ore)
+    if Runtime.MiningMouseHeld == held then
+        return
+    end
+
+    Runtime.MiningMouseHeld = held
+
+    local point = ore and screenPointOf(ore)
+    local camera = Workspace.CurrentCamera
+    local viewport = camera and camera.ViewportSize or Vector2.new(800, 600)
+    local x = point and point.X or viewport.X / 2
+    local y = point and point.Y or viewport.Y / 2
+
+    mouseButtonAt(x, y, held)
+end
+
+local function oreName(model)
+    if not model then
+        return nil
+    end
+
+    return tostring(
+        model:GetAttribute("Ore")
+        or model:GetAttribute("Name")
+        or model.Name
+    )
+end
+
+local function oreIsAvailable(model)
+    if not model or not model.Parent or not model:IsA("Model") then
+        return false
+    end
+
+    if model:GetAttribute("ObjectType") ~= "Ore"
+        and model:GetAttribute("Ore") == nil then
+        return false
+    end
+
+    return model:GetAttribute("Mined") ~= true
+        and objectRoot(model) ~= nil
+end
+
+local function questRequiredOre()
+    local _, taskData = QuestService.GetNextTask()
+    if not taskData or taskData.Kind ~= "Mine" then
+        return nil
+    end
+
+    local target = normalize(taskData.Target)
+    if target == "" then
+        return nil
+    end
+
+    for _, name in ipairs(ORE_CATALOG) do
+        local a = lower(name)
+        local b = lower(target)
+        if a == b or a:find(b, 1, true) or b:find(a, 1, true) then
+            return name
+        end
+    end
+
+    return target
+end
+
+function MiningQTEService.GetWantedOre()
+    if Config.MiningMode == "Quest Required" then
+        return questRequiredOre() or Config.SelectedOre
+    elseif Config.MiningMode == "Selected Ore" then
+        return Config.SelectedOre
+    end
+
+    return nil
+end
+
+function MiningQTEService.GetOreOptions()
+    local set = {}
+    for _, name in ipairs(ORE_CATALOG) do
+        set[name] = true
+    end
+
+    for model in pairs(Runtime.Ores) do
+        if oreIsAvailable(model) then
+            set[oreName(model)] = true
+        end
+    end
+
+    local result = {}
+    for name in pairs(set) do
+        table.insert(result, name)
+    end
+    table.sort(result)
+    return result
+end
+
+function MiningQTEService.FindOre()
+    local wanted = MiningQTEService.GetWantedOre()
+    local best
+    local bestDistance
+    local bestDrop = -math.huge
+
+    for model in pairs(Runtime.Ores) do
+        if oreIsAvailable(model) then
+            local name = oreName(model)
+            local accepted = Config.MiningMode == "Any Available"
+                or wanted == nil
+                or lower(name) == lower(wanted)
+
+            if accepted then
+                local distance = distanceTo(model)
+                local drop = tonumber(model:GetAttribute("DropAmount")) or 0
+
+                if Config.MiningMode == "Highest Drop" then
+                    if drop > bestDrop or (drop == bestDrop and (not bestDistance or distance < bestDistance)) then
+                        best = model
+                        bestDrop = drop
+                        bestDistance = distance
+                    end
+                elseif not bestDistance or distance < bestDistance then
+                    best = model
+                    bestDistance = distance
+                end
+            end
+        end
+    end
+
+    return best
+end
+
+local function findPickaxe()
+    HotbarService.Refresh()
+
+    for _, data in pairs(HotbarService.Slots) do
+        if lower(data.Title):find("pickaxe", 1, true) then
+            return data
+        end
+    end
+
+    return nil
+end
+
+local function findMiningQTE()
+    local screen = qteScreen()
+    if not screen then
+        return nil
+    end
+
+    -- The real Mining QTE in the dump is:
+    -- Events/Mining/Mining/Frame/{Critical Zone, Amount}
+    for _, object in ipairs(screen:GetDescendants()) do
+        if object:IsA("BillboardGui")
+            and object.Name == "Mining"
+            and object.Enabled
+            and object.Parent
+            and object.Parent.Name == "Mining" then
+
+            local frame = object:FindFirstChild("Frame")
+            local critical = frame and frame:FindFirstChild("Critical Zone")
+            local amount = frame and frame:FindFirstChild("Amount")
+
+            if critical and amount
+                and critical:IsA("GuiObject")
+                and amount:IsA("GuiObject") then
+                return object, frame, critical, amount
+            end
+        end
+    end
+
+    return nil
+end
+
+local function miningAmountTop(amount)
+    -- Amount is anchored at Y=1 and grows upward.
+    return 1 - math.clamp(amount.Size.Y.Scale, 0, 1)
+end
+
+local function miningCriticalBand(critical)
+    local top = critical.Position.Y.Scale
+    local bottom = top + critical.Size.Y.Scale
+    return math.min(top, bottom), math.max(top, bottom)
+end
+
+function MiningQTEService.HandleQTE(ore)
+    if not Config.AutoMiningQTE then
+        return false
+    end
+
+    local _, _, critical, amount = findMiningQTE()
+    if not critical or not amount then
+        return false
+    end
+
+    local amountTop = miningAmountTop(amount)
+    local criticalTop, criticalBottom = miningCriticalBand(critical)
+    local tolerance = Config.MiningCriticalTolerance
+
+    -- Game tutorial confirms: hold mouse to charge; release at the target/top.
+    -- We use the actual green Critical Zone instead of a guessed fixed %.
+    local inside = amountTop >= (criticalTop - tolerance)
+        and amountTop <= (criticalBottom + tolerance)
+
+    if inside and not Runtime.MiningReleaseDone then
+        miningMouse(false, ore)
+        Runtime.MiningReleaseDone = true
+        Runtime.MiningLastQTE = os.clock()
+        setMiningState("RELEASE", string.format("Released on %s critical zone", oreName(ore)))
+    elseif not Runtime.MiningReleaseDone then
+        miningMouse(true, ore)
+        setMiningState("CHARGE", string.format("Charging %s", oreName(ore)))
+    end
+
+    return true
+end
+
+function MiningQTEService.Reset(reason)
+    miningMouse(false, Runtime.MiningTarget)
+    Runtime.MiningTarget = nil
+    Runtime.MiningReleaseDone = false
+    setMiningState("CHECK", reason or "reset")
+end
+
+function MiningQTEService.Step()
+    local progressionMining = Config.AutoProgress
+        and Runtime.ProgressLifeSkill == "Mining"
+
+    if not Config.AutoMining and not progressionMining then
+        MiningQTEService.Reset("Auto Mining disabled")
+        return 0.8
+    end
+
+    if Config.AutoProgress and Runtime.ProgressLifeSkill ~= "Mining" then
+        MiningQTEService.Reset("Progression owns another task")
+        return 0.8
+    end
+
+    if not PlayerState.IsReady() then
+        MiningQTEService.Reset("Player not ready")
+        return 0.8
+    end
+
+    local ore = Runtime.MiningTarget
+    if not oreIsAvailable(ore) then
+        ore = MiningQTEService.FindOre()
+        Runtime.MiningTarget = ore
+        Runtime.MiningReleaseDone = false
+    end
+
+    if not ore then
+        miningMouse(false)
+        setMiningState("WAIT_ORE", "No matching ore spawned")
+        return 0.8
+    end
+
+    local wanted = oreName(ore)
+    local distance = distanceTo(ore)
+
+    if distance > Config.PlatformArrivalDistance then
+        miningMouse(false, ore)
+        setMiningState("MOVE", "Moving to " .. wanted)
+        PlatformTransport.MoveNear(ore)
+        return 0.18
+    end
+
+    PlatformTransport.Cancel(true)
+
+    local pickaxe = findPickaxe()
+    if not pickaxe then
+        miningMouse(false, ore)
+        setMiningState("MISSING_PICKAXE", "No pickaxe in hotbar")
+        return 0.8
+    end
+
+    HotbarService.Press(pickaxe)
+
+    if Config.MiningAutoAim then
+        local ownRoot = rootPart()
+        local targetPart = objectRoot(ore)
+        if ownRoot and targetPart then
+            pcall(function()
+                ownRoot.CFrame = CFrame.lookAt(
+                    ownRoot.Position,
+                    Vector3.new(targetPart.Position.X, ownRoot.Position.Y, targetPart.Position.Z)
+                )
+            end)
+        end
+    end
+
+    if MiningQTEService.HandleQTE(ore) then
+        if Runtime.MiningReleaseDone then
+            -- Wait for the game to consume the release and either reset the bar
+            -- or mark the ore Mined before another swing.
+            if os.clock() - Runtime.MiningLastQTE >= Config.MiningRetryDelay then
+                Runtime.MiningReleaseDone = false
+                Runtime.MiningLastAttempt = os.clock()
+            end
+        end
+        return 0.035
+    end
+
+    -- No QTE yet: start/continue one mining swing by holding M1 on the ore.
+    local elapsed = os.clock() - Runtime.MiningStateSince
+    if Runtime.MiningState ~= "HOLD" then
+        setMiningState("HOLD", "Holding M1 on " .. wanted)
+        Runtime.MiningStateSince = os.clock()
+        miningMouse(true, ore)
+    elseif elapsed >= Config.MiningHoldTimeout then
+        miningMouse(false, ore)
+        Runtime.MiningLastAttempt = os.clock()
+        setMiningState("RETRY", "Mining QTE timeout")
+        return Config.MiningRetryDelay
+    end
+
+    return 0.05
+end
+
+-- ============================================================
+-- Lifeskill / collection
+-- ============================================================
+
+LifeSkillService = {}
+
+local function promptFeatureEnabled(kind)
+    return kind == "Pickup" and Config.AutoPickup
+        or kind == "Chest" and Config.AutoChest
+        or kind == "WorldBossChest" and Config.AutoWorldBossChest
+        or kind == "FruitChest" and Config.AutoFruitChest
+        or kind == "QuestItem" and Config.AutoQuestItems
+        or kind == "Farm" and (
+            Config.AutoFarming
+            or Runtime.ProgressLifeSkill == "Farming"
+        )
+end
+
+function LifeSkillService.FindNearestEnabledPrompt()
+    local best
+    local bestDistance
+
+    for prompt in pairs(Runtime.Prompts) do
+        if prompt and prompt.Parent and prompt.Enabled then
+            local kind = promptKind(prompt)
+
+            if promptFeatureEnabled(kind) then
+                local distance = distanceTo(prompt)
+
+                if not bestDistance or distance < bestDistance then
+                    best = prompt
+                    bestDistance = distance
+                end
+            end
+        end
+    end
+
+    return best, bestDistance
+end
+
+function LifeSkillService.StepPrompts()
+    if Config.AutoProgress then
+        -- While full progression is active, only collect nearby loot.
+        local prompt, distance = LifeSkillService.FindNearestEnabledPrompt()
+
+        if prompt and distance <= 12 then
+            InteractionService.FirePrompt(prompt)
+        end
+
+        return
+    end
+
+    local prompt = LifeSkillService.FindNearestEnabledPrompt()
+    if not prompt then
+        return
+    end
+
+    local kind = promptKind(prompt)
+
+
+    if distanceTo(prompt) > Config.PlatformArrivalDistance then
+        PlatformTransport.MoveNear(prompt)
+    else
+        PlatformTransport.Cancel(true)
+        InteractionService.FirePrompt(prompt)
+    end
+end
+
+-- ============================================================
+-- Progression controller
+-- ============================================================
+
+ProgressionController = {}
+
+local function setProgressState(state, detail)
+    Runtime.ProgressState = state
+    Runtime.ProgressDetail = detail or ""
+end
+
+local function clearFarmState()
+    Runtime.CurrentTarget = nil
+    Runtime.CurrentWantedMob = nil
+    Runtime.FarmAnchorCFrame = nil
+
+    HitboxService.Clear()
+end
+
+local function handleQuestNpc(questName, preferredNpc, stateName)
+    local npc = QuestCatalogService.FindQuestGiver(questName, preferredNpc)
+
+    if not npc and preferredNpc then
+        npc = TargetService.FindNamedNPC(preferredNpc)
+    end
+
+    if not npc then
+        setProgressState("SEARCH_NPC", questName .. " / " .. tostring(preferredNpc or ""))
+        return
+    end
+
+    Runtime.CurrentTarget = npc
+    Runtime.CurrentWantedMob = nil
+    HitboxService.Clear()
+
+    local arrived = distanceTo(npc) <= math.max(
+        Config.PlatformArrivalDistance + 2,
+        9
+    )
+
+    if not arrived then
+        setProgressState("MOVE_NPC", questName)
+        PlatformTransport.MoveNear(npc)
+        return
+    end
+
+    PlatformTransport.Cancel(true)
+    setProgressState(stateName, questName)
+
+    InteractionService.InteractWithQuestNPC(npc, questName)
+end
+
+local function handleDefeatTask(quest, taskData)
+    local wanted = taskData.Target
+    local current = Runtime.CurrentTarget
+
+    if not current
+        or not current.Parent
+        or not TargetService.IsFarmMob(current, wanted) then
+
+        current = TargetService.Find(wanted)
+        Runtime.CurrentTarget = current
+        Runtime.FarmAnchorCFrame = nil
+    end
+
+    Runtime.CurrentWantedMob = wanted
+
+    if not current then
+        setProgressState("SEARCH_MOBS", wanted)
+        return
+    end
+
+    if not Runtime.FarmAnchorCFrame then
+        PlatformTransport.SetFarmAnchorFrom(current)
+    end
+
+    local root = rootPart()
+    local anchor = Runtime.FarmAnchorCFrame
+    local atAnchor = root
+        and anchor
+        and (root.Position - anchor.Position).Magnitude
+            <= Config.PlatformArrivalDistance
+
+    if not atAnchor then
+        setProgressState("MOVE_ABOVE_MOBS", wanted)
+        PlatformTransport.MoveToFarmAnchor()
+        return
+    end
+
+    PlatformTransport.Cancel(true)
+
+    setProgressState("FARM_QUEST_MOBS", wanted)
+
+    BringService.Step(wanted)
+    HitboxService.Step(wanted)
+
+    -- Keep a current target for aim/ESP, but farm is centered below the player.
+    if not Runtime.CurrentTarget
+        or not Runtime.CurrentTarget.Parent
+        or not TargetService.IsFarmMob(Runtime.CurrentTarget, wanted) then
+        Runtime.CurrentTarget = TargetService.Find(wanted)
+    end
+
+    if Runtime.CurrentTarget then
+        CombatService.AimAt(Runtime.CurrentTarget)
+    end
+
+    CombatService.AttackStep()
+end
+
+local function handleCollectTask(quest, taskData)
+    clearFarmState()
+
+    local allowed = {
+        Pickup = true,
+        QuestItem = true,
+        Chest = true,
+        FruitChest = true,
+        Other = true,
+    }
+
+    local prompt = InteractionService.FindPromptByText(
+        taskData.Target,
+        allowed
+    )
+
+    if not prompt then
+        setProgressState("SEARCH_OBJECT", taskData.Target)
+        return
+    end
+
+    Runtime.CurrentTarget = prompt
+
+    if distanceTo(prompt) > Config.PlatformArrivalDistance + 2 then
+        setProgressState("MOVE_OBJECT", taskData.Target)
+        PlatformTransport.MoveNear(prompt)
+        return
+    end
+
+    PlatformTransport.Cancel(true)
+    setProgressState("INTERACT_OBJECT", taskData.Target)
+    InteractionService.FirePrompt(prompt)
+end
+
+function ProgressionController.Step()
+    if not Config.AutoProgress then
+        Runtime.ProgressLifeSkill = nil
+        setProgressState("IDLE", "Auto Progress disabled")
+        clearFarmState()
+        return
+    end
+
+    Runtime.ProgressLifeSkill = nil
+
+    if not PlayerState.IsReady() then
+        setProgressState("WAIT_PLAYER", "Player data/character not ready")
+        return
+    end
+
+    if Config.FarmMode == "Selected Mob" then
+        local pseudoQuest = {Name = "Selected Mob"}
+        local pseudoTask = {
+            Kind = "Defeat",
+            Target = Config.SelectedMob,
+            Text = "Farm " .. Config.SelectedMob,
+        }
+
+        handleDefeatTask(pseudoQuest, pseudoTask)
+        return
+    end
+
+    if not Config.AutoQuest then
+        setProgressState("WAIT_QUEST", "Auto Quest disabled")
+        clearFarmState()
+        return
+    end
+
+    local stateKey = QuestService.StateKey()
+    if stateKey ~= Runtime.ProgressQuestKey then
+        Runtime.ProgressQuestKey = stateKey
+        Runtime.LastQuestChange = os.clock()
+
+        PlatformTransport.Cancel(true)
+        Runtime.FarmAnchorCFrame = nil
+        HitboxService.Clear()
+    end
+
+    local completed = QuestService.GetCompletedQuest()
+
+    if completed and Config.AutoTurnIn then
+        clearFarmState()
+        handleQuestNpc(completed.Name, nil, "TURN_IN")
+        return
+    end
+
+    local quest, taskData = QuestService.GetNextTask()
+
+    if quest and taskData then
+        if taskData.Kind == "Defeat" then
+            handleDefeatTask(quest, taskData)
+        elseif taskData.Kind == "Talk"
+            or taskData.Kind == "Return"
+            or taskData.Kind == "Deliver" then
+
+            clearFarmState()
+            handleQuestNpc(
+                quest.Name,
+                taskData.Target,
+                "QUEST_DIALOGUE"
+            )
+        elseif taskData.Kind == "Collect"
+            or taskData.Kind == "Find" then
+
+            handleCollectTask(quest, taskData)
+        elseif taskData.Kind == "Fish" then
+            clearFarmState()
+            Runtime.ProgressLifeSkill = "Fishing"
+            setProgressState(
+                "QUEST_FISHING",
+                taskData.Text
+            )
+        elseif taskData.Kind == "Mine" then
+            clearFarmState()
+            Runtime.ProgressLifeSkill = "Mining"
+            setProgressState(
+                "QUEST_MINING",
+                taskData.Text
+            )
+        elseif taskData.Kind == "Farm" then
+            clearFarmState()
+            Runtime.ProgressLifeSkill = "Farming"
+            setProgressState(
+                "QUEST_FARMING",
+                taskData.Text
+            )
+        elseif taskData.Kind == "Craft"
+            or taskData.Kind == "Cook"
+            or taskData.Kind == "Upgrade"
+            or taskData.Kind == "Learn" then
+
+            clearFarmState()
+            setProgressState(
+                "QUEST_MANUAL_ACTION",
+                taskData.Text
+            )
+        else
+            -- Generic resolver: try object prompt first, then named NPC.
+            local prompt = InteractionService.FindPromptByText(taskData.Target)
+
+            if prompt then
+                handleCollectTask(quest, taskData)
+            else
+                clearFarmState()
+                handleQuestNpc(
+                    quest.Name,
+                    taskData.Target,
+                    "QUEST_GENERIC"
+                )
+            end
+        end
+
+        return
+    end
+
+    local recommended = QuestService.GetRecommended()
+
+    if recommended and Config.AutoAcceptRecommended then
+        clearFarmState()
+        handleQuestNpc(
+            recommended.Name,
+            nil,
+            "ACCEPT_RECOMMENDED"
+        )
+        return
+    end
+
+    clearFarmState()
+    PlatformTransport.Cancel(true)
+    setProgressState(
+        "IDLE",
+        "No active/recommended quest at Lv." .. PlayerState.GetLevel()
+    )
 end
 
 -- ============================================================
@@ -1999,10 +4059,10 @@ end
 -- ============================================================
 
 local function restoreCollision()
-    for part, original in pairs(Core.CollisionBackup) do
+    for part, value in pairs(Core.CollisionBackup) do
         if part and part.Parent then
             pcall(function()
-                part.CanCollide = original
+                part.CanCollide = value
             end)
         end
     end
@@ -2010,7 +4070,7 @@ local function restoreCollision()
     table.clear(Core.CollisionBackup)
 end
 
-local function processCharacter()
+local function updateCharacter()
     local hum = humanoid()
     local char = character()
 
@@ -2029,7 +4089,10 @@ local function processCharacter()
     end
 
     local shouldNoclip = Config.Noclip
-        or (Config.TweenNoclip and Runtime.CurrentTween ~= nil)
+        or (
+            Config.PlatformNoclip
+            and Runtime.TransportMoving
+        )
 
     if shouldNoclip and char then
         for _, object in ipairs(char:GetDescendants()) do
@@ -2048,13 +4111,14 @@ end
 
 connect(RunService.Stepped, function()
     if Core.Running then
-        processCharacter()
+        updateCharacter()
     end
 end)
 
 connect(UserInputService.JumpRequest, function()
     if Core.Running and Config.InfiniteJump then
         local hum = humanoid()
+
         if hum then
             hum:ChangeState(Enum.HumanoidStateType.Jumping)
         end
@@ -2062,10 +4126,10 @@ connect(UserInputService.JumpRequest, function()
 end)
 
 -- ============================================================
--- ESPService
+-- ESP
 -- ============================================================
 
-local ESPService = {
+ESPService = {
     Folder = track(Instance.new("Folder")),
     Map = setmetatable({}, {__mode = "k"}),
 }
@@ -2082,18 +4146,19 @@ end
 
 function ESPService.Clear(object)
     local highlight = ESPService.Map[object]
-
     if highlight then
         pcall(function()
             highlight:Destroy()
         end)
-
         ESPService.Map[object] = nil
     end
 end
 
 function ESPService.Set(object, color)
-    if not object or not object.Parent or distanceTo(object) > Config.ESPDistance then
+    if not object
+        or not object.Parent
+        or distanceTo(object) > Config.ESPDistance then
+
         ESPService.Clear(object)
         return
     end
@@ -2103,7 +4168,8 @@ function ESPService.Set(object, color)
     if object:IsA("Model") or object:IsA("BasePart") then
         adornee = object
     else
-        adornee = object:FindFirstAncestorWhichIsA("Model") or objectRoot(object)
+        adornee = object:FindFirstAncestorWhichIsA("Model")
+            or objectRoot(object)
     end
 
     if not adornee then
@@ -2124,24 +4190,25 @@ function ESPService.Set(object, color)
     highlight.Adornee = adornee
     highlight.FillColor = color
     highlight.OutlineColor = color
-    highlight.Enabled = true
 end
 
 function ESPService.Step()
     local active = {}
 
-    if Config.QuestTargetESP and Runtime.CurrentTarget then
+    if Config.CurrentTargetESP and Runtime.CurrentTarget then
         active[Runtime.CurrentTarget] = true
-        ESPService.Set(Runtime.CurrentTarget, Config.QuestColor)
+        ESPService.Set(Runtime.CurrentTarget, Config.TargetColor)
     end
 
     if Config.MobESP or Config.BossESP then
         for model in pairs(Runtime.Entities) do
-            if TargetService.IsAliveNPC(model) then
+            if TargetService.IsAliveNPC(model)
+                and not TargetService.IsDialogueNPC(model) then
+
                 if Config.BossESP and TargetService.IsBoss(model) then
                     active[model] = true
                     ESPService.Set(model, Config.BossColor)
-                elseif Config.MobESP and not TargetService.IsBoss(model) then
+                elseif Config.MobESP and TargetService.IsHostile(model) then
                     active[model] = true
                     ESPService.Set(model, Config.MobColor)
                 end
@@ -2175,70 +4242,39 @@ function ESPService.Step()
 end
 
 -- ============================================================
--- Progress monitor
--- ============================================================
-
-local function monitorProgress()
-    local level = PlayerState.GetLevel()
-
-    if Runtime.LastLevel == nil then
-        Runtime.LastLevel = level
-    elseif Runtime.LastLevel ~= level then
-        local oldLevel = Runtime.LastLevel
-        Runtime.LastLevel = level
-
-        notify(
-            "Level Up",
-            string.format("Lv.%d → Lv.%d • Auto Farm recalculating", oldLevel, level),
-            4
-        )
-
-        TweenController.Cancel()
-    end
-
-    local questKey = QuestService.StateKey()
-
-    if Runtime.LastQuestKey == nil then
-        Runtime.LastQuestKey = questKey
-    elseif Runtime.LastQuestKey ~= questKey then
-        Runtime.LastQuestKey = questKey
-        TweenController.Cancel()
-    end
-end
-
--- ============================================================
--- Main loops
+-- Schedulers
 -- ============================================================
 
 task.spawn(function()
     while Core.Running do
-        monitorProgress()
-        FarmService.Step()
-        CombatService.UpdateBlock()
-        task.wait(0.10)
+        local delay = MiningQTEService.Step()
+        task.wait(tonumber(delay) or 0.5)
     end
 end)
 
 task.spawn(function()
     while Core.Running do
-        LifeSkillService.ProcessPrompts()
-        task.wait(0.18)
+        if Config.AutoClaim then
+            InteractionService.ProcessClaimButtons()
+        end
+
+        task.wait(Config.AutoClaim and 0.8 or 1.5)
     end
 end)
 
 task.spawn(function()
     while Core.Running do
-        InteractionService.ProcessDialogue()
-        InteractionService.ProcessClaims()
-        LifeSkillService.ProcessFishing()
-        task.wait(0.10)
-    end
-end)
+        local active =
+            Config.CurrentTargetESP
+            or Config.MobESP
+            or Config.BossESP
+            or Config.LootESP
 
-task.spawn(function()
-    while Core.Running do
-        ESPService.Step()
-        task.wait(0.65)
+        if active then
+            ESPService.Step()
+        end
+
+        task.wait(active and 0.85 or 1.8)
     end
 end)
 
@@ -2255,20 +4291,47 @@ task.spawn(function()
     end
 end)
 
+task.spawn(function()
+    while Core.Running do
+        local level = PlayerState.GetLevel()
+
+        if Runtime.LastLevel == nil then
+            Runtime.LastLevel = level
+        elseif Runtime.LastLevel ~= level then
+            local previous = Runtime.LastLevel
+            Runtime.LastLevel = level
+
+            notify(
+                "Level Up",
+                string.format(
+                    "Lv.%d → Lv.%d • progression refreshed",
+                    previous,
+                    level
+                ),
+                4
+            )
+
+            Runtime.FarmAnchorCFrame = nil
+            PlatformTransport.Cancel(true)
+        end
+
+        task.wait(0.5)
+    end
+end)
+
 -- ============================================================
--- Runtime info
+-- UI helpers
 -- ============================================================
 
-local function currentQuestText()
-    local quest, taskData = QuestService.GetNextTask()
-
-    if quest and taskData then
-        return quest.Name .. " → " .. taskData.Text
+local function currentQuestSummary()
+    local completed = QuestService.GetCompletedQuest()
+    if completed then
+        return completed.Name .. " → ready to turn in"
     end
 
-    local complete = QuestService.GetCompletedQuest()
-    if complete then
-        return complete.Name .. " → Ready to turn in"
+    local quest, taskData = QuestService.GetNextTask()
+    if quest and taskData then
+        return quest.Name .. " → " .. taskData.Text
     end
 
     local recommended = QuestService.GetRecommended()
@@ -2279,150 +4342,177 @@ local function currentQuestText()
     return "None"
 end
 
-local function homeStatus()
-    local hum = humanoid()
-    local health = hum and string.format("%.0f/%.0f", hum.Health, hum.MaxHealth) or "Unknown"
-
+local function runtimeStatus()
     return table.concat({
         "SON HUB v" .. VERSION,
-        "Level: " .. PlayerState.GetLevel(),
+        "Level: " .. tostring(PlayerState.GetLevel()),
         "World: " .. PlayerState.GetWorld(),
-        "Fruit: " .. PlayerState.GetFruit() .. " (Lv." .. PlayerState.GetFruitLevel() .. ")",
-        "Bounty: " .. PlayerState.GetBounty(),
-        "Faction: " .. PlayerState.GetLeaderString("Faction"),
-        "Crew: " .. (PlayerState.GetLeaderString("Crew") ~= "" and PlayerState.GetLeaderString("Crew") or "None"),
-        "Health: " .. health,
-        "Weapon Types: " .. PlayerState.GetWeaponTypes(),
-        "Quest: " .. currentQuestText(),
-        "Worker: " .. Runtime.WorkerState .. " • " .. Runtime.WorkerDetail,
+        "Fruit: " .. PlayerState.GetFruit()
+            .. " (Lv." .. PlayerState.GetFruitLevel() .. ")",
+        "Bounty: " .. tostring(PlayerState.GetLeaderValue("Bounty") or 0),
+        "Faction: " .. tostring(PlayerState.GetLeaderValue("Faction") or "None"),
+        "Crew: " .. tostring(PlayerState.GetLeaderValue("Crew") or "None"),
+        "Quest: " .. currentQuestSummary(),
+        "Progress: " .. Runtime.ProgressState
+            .. " • " .. Runtime.ProgressDetail,
         "Hotbar: " .. HotbarService.GetSnapshot(),
+        "Quest catalog: " .. tostring(#Runtime.QuestCatalog),
     }, "\n")
 end
 
 local function detectedSystems()
     return table.concat({
-        "Quest + RecommendedQuest",
-        "Entities / NPC Combat / BossCombat",
-        "Custom Backpack + 0-9 Hotbar",
-        "Fruit + Fruit Level",
+        "151 Quest modules + live RecommendedQuest",
+        "DialogueNPC QuestName / QuestNode mapping",
+        "Entities / Combat / BossCombat",
+        "Moving Platform transport",
+        "Quest-only Bring + mob-only Hitbox",
+        "Custom 0-9 Hotbar + Cooldown/EXP",
+        "Auto Stats via Radar stat buttons",
+        "Skill EXP / Mastery candidate cycling",
+        "Fishing: SHAKE / CLICK / Timed Release / Reel",
+        "Mining Critical Zone QTE",
+        "Fishing / Mining / Farming",
+        "Fruit / FruitLevel",
         "Bounty / Faction / Crew",
-        "Pickup / Money Bag / Quest Item",
-        "Fruit Chest / World Boss Chest",
-        "Fishing",
-        "Mining / Ores",
-        "Farming / Crops / FarmGear / Pests",
-        "Treasure Map DigSpots",
-        "Crafting / Blacksmith UI",
-        "Ships / Ship Spawn",
-        "Trade / Crews",
-        "Logbook achievements + Claim",
-        "Block (F) / Dash systems",
+        "Pickup / Chest / Fruit Chest / World Boss Chest",
+        "Treasure / DigSpots",
+        "Logbook Claim",
+        "Block = F",
     }, "\n")
 end
 
 -- ============================================================
--- UI — exact requested tab structure
+-- UI
 -- ============================================================
 
 local Window = Library:CreateWindow({
     Title = "SON HUB",
-    Subtitle = "Automatic Progress • make by hongson",
+    Subtitle = "Quest Platform Farm • make by hongson",
     SubtitleColor = Color3.fromRGB(100, 190, 255),
-
-    -- Uses the library's own example asset instead of random external icons.
-    Logo = "rbxassetid://82367817676382",
+    Logo = SON_ICON_URL,
     LogoSize = 32,
-
-    SphereText = true,
-    SphereWords = "S",
-    SphereImage = "rbxassetid://82367817676382",
+    SphereText = false,
+    SphereWords = "SON",
+    SphereImage = SON_ICON_URL,
     SphereIconSize = 38,
 })
 
--- ============================================================
--- 🏠 Home
--- ============================================================
+-- ---------------- Home ----------------
 
-local HomeTab = Window:CreateTab("🏠 Trang Chủ", true, false)
+local HomeTab = Window:CreateTab("⌂ Trang Chủ", true, false)
 local HomePage = HomeTab:CreatePage("Dashboard")
 
-local HomeStatusCard = HomePage:CreateSection("Player Status")
+local StatusCard = HomePage:CreateSection("Live Status")
 
-HomeStatusCard:AddButton("Refresh Player Status", function()
-    notify("SON HUB • Status", homeStatus(), 8)
-end, {
-    Title = "Live Player Status",
-    Description = "Đọc trực tiếp Level, World, Fruit, Bounty, Faction, Crew, Health, Weapon và Quest hiện tại.",
-})
-
-HomeStatusCard:AddButton("Refresh Hotbar / Weapons", function()
-    HotbarService.Refresh()
-    notify("Hotbar", HotbarService.GetSnapshot(), 6)
+StatusCard:AddButton("Show Runtime Status", function()
+    notify("SON HUB", runtimeStatus(), 10)
 end)
 
-local QuickCard = HomePage:CreateSection("Quick Automation")
+StatusCard:AddButton("Refresh Index / Quest Map", function()
+    task.spawn(function()
+        RuntimeIndex.Rebuild()
+        QuestCatalogService.Build()
+        HotbarService.Refresh()
+        notify(
+            "SON HUB",
+            "Index rebuilt • "
+                .. tostring(#Runtime.QuestCatalog)
+                .. " quests",
+            4
+        )
+    end)
+end)
 
-QuickCard:AddToggle("Full Auto Farm", false, function(value)
-    Config.AutoFarm = value
+local QuickCard = HomePage:CreateSection("One Toggle")
+
+QuickCard:AddToggle("Full Auto Progress", false, function(value)
+    Config.AutoProgress = value
 
     if value then
         Config.FarmMode = "Smart Quest"
         Config.AutoQuest = true
-        notify("Auto Farm", "Smart Quest mode activated.", 3)
+        Config.BringMobs = true
+        Config.MobHitbox = true
+        Config.AutoAttack = true
+        Config.AutoClaim = true
+
+        notify(
+            "Full Auto",
+            "Quest → Platform → Bring → Hitbox → Kill → Turn-in",
+            4
+        )
     else
-        TweenController.Cancel()
+        PlatformTransport.Cancel(false)
+        HitboxService.Clear()
+        Runtime.FarmAnchorCFrame = nil
         Runtime.CurrentTarget = nil
     end
 end, {
-    Title = "One Toggle Progress",
-    Description = "Tự đọc level + quest, nhận quest phù hợp, Tween, đánh mob, làm task và turn-in.",
+    Title = "Full Auto Progress",
+    Description = "Tự nhận quest, lên platform trên khu mob, bring đúng mob task xuống dưới chân, hitbox mob, đánh đến khi task hoàn thành rồi turn-in.",
 })
 
-QuickCard:AddToggle("Auto Claim Rewards", true, function(value)
-    Config.AutoClaim = value
+QuickCard:AddToggle("Auto Stats", false, function(value)
+    Config.AutoStats = value
 end)
 
--- ============================================================
--- ⚔️ Farm
--- ============================================================
+QuickCard:AddToggle("Auto Mastery", false, function(value)
+    Config.AutoMastery = value
+end)
 
-local FarmTab = Window:CreateTab("⚔️ Farm", false, false)
-local FarmMainPage = FarmTab:CreatePage("Auto Farm")
-local FarmAdvancedPage = FarmTab:CreatePage("Bring / Weapon")
-
-local FarmCard = FarmMainPage:CreateSection("Farm Worker")
-
-FarmCard:AddToggle("Auto Farm", false, function(value)
-    Config.AutoFarm = value
+QuickCard:AddToggle("Full Auto Everything", false, function(value)
+    Config.AutoProgress = value
+    Config.AutoStats = value
+    Config.AutoMastery = value
+    Config.AutoQuest = true
+    Config.BringMobs = true
+    Config.MobHitbox = true
+    Config.AutoAttack = true
+    Config.AutoClaim = true
 
     if not value then
-        TweenController.Cancel()
-        Runtime.CurrentTarget = nil
+        PlatformTransport.Cancel(false)
+        HitboxService.Clear()
     end
 end, {
-    Title = "Auto Farm Master",
-    Description = "Smart Quest mặc định tự check Level + Quest; cũng có thể farm mob hoặc boss thủ công.",
+    Title = "Progress + Stats + Mastery",
+    Description = "Bật chung Auto Progress, Auto Stats và Auto Mastery. Stat Build/Mastery Mode vẫn theo cấu hình bạn chọn.",
 })
+
+-- ---------------- Farm ----------------
+
+local FarmTab = Window:CreateTab("⚔ Farm", false, false)
+local FarmPage = FarmTab:CreatePage("Quest Farm")
+local BringPage = FarmTab:CreatePage("Bring / Hitbox")
+local MasteryPage = FarmTab:CreatePage("Mastery")
+
+local FarmCard = FarmPage:CreateSection("Progression")
+
+FarmCard:AddToggle("Auto Progress", false, function(value)
+    Config.AutoProgress = value
+
+    if not value then
+        PlatformTransport.Cancel(false)
+        HitboxService.Clear()
+    end
+end)
 
 FarmCard:AddDropdown(
     "Farm Mode",
-    {"Smart Quest", "Selected Mob", "Boss"},
+    {"Smart Quest", "Selected Mob"},
     false,
-    function(selected)
-        Config.FarmMode = selected
-        TweenController.Cancel()
-    end,
-    {
-        Title = "Farm Mode",
-        Description = "Smart Quest = full automatic. Selected Mob = farm loại mob chọn. Boss = ưu tiên boss client-visible.",
-    }
+    function(value)
+        Config.FarmMode = value
+        Runtime.FarmAnchorCFrame = nil
+    end
 )
 
 local mobOptions = TargetService.GetMobOptions()
 
-FarmCard:AddDropdown("Select Mob", mobOptions, false, function(selected)
-    Config.SelectedMob = selected
-    TweenController.Cancel()
+FarmCard:AddDropdown("Selected Mob", mobOptions, false, function(value)
+    Config.SelectedMob = value
+    Runtime.FarmAnchorCFrame = nil
 end)
 
 FarmCard:AddToggle("Auto Attack", true, function(value)
@@ -2433,117 +4523,181 @@ FarmCard:AddSlider("Attack / Second", 2, 20, Config.AttackRate, function(value)
     Config.AttackRate = value
 end)
 
-FarmCard:AddToggle("Auto Loot While Farming", true, function(value)
-    Config.AutoLootAfterFarm = value
-    Config.AutoPickup = value
-end)
+local PlatformCard = FarmPage:CreateSection("Moving Platform")
 
-local WeaponCard = FarmAdvancedPage:CreateSection("Weapon / Hotbar")
+PlatformCard:AddToggle("Platform Transport", true, function(value)
+    Config.PlatformTransport = value
 
-local weaponOptions = HotbarService.GetOptions()
-
-WeaponCard:AddDropdown("Select Weapon", weaponOptions, false, function(selected)
-    Config.SelectedWeapon = selected
-    Runtime.LastWeaponTitle = nil
+    if not value then
+        PlatformTransport.Cancel(false)
+    end
 end, {
-    Title = "Select Weapon",
-    Description = "Danh sách lấy trực tiếp từ custom Hotbar của game. Auto bỏ qua Key/Fragment/Rock/Pickaxe và ưu tiên skill combat.",
+    Title = "Platform Movement",
+    Description = "Tạo một platform local dưới chân, weld người chơi vào platform trong lúc platform Tween, đến nơi thì tháo weld và để platform đứng yên.",
 })
 
-WeaponCard:AddButton("Refresh Weapon Detection", function()
-    HotbarService.Refresh()
-    notify("Detected Weapons", HotbarService.GetSnapshot(), 6)
+PlatformCard:AddSlider("Platform Speed", 60, 450, Config.PlatformSpeed, function(value)
+    Config.PlatformSpeed = value
 end)
 
-WeaponCard:AddToggle("Auto Use Selected Skill", false, function(value)
-    Config.AutoSkill = value
-end, {
-    Title = "Auto Skill",
-    Description = "Ngoài M1, định kỳ kích hoạt slot/hotbar đã chọn.",
-})
-
-WeaponCard:AddSlider("Skill Interval", 1, 8, Config.AutoSkillDelay, function(value)
-    Config.AutoSkillDelay = value
+PlatformCard:AddSlider("Farm Height", 6, 24, Config.PlatformFarmHeight, function(value)
+    Config.PlatformFarmHeight = value
+    Runtime.FarmAnchorCFrame = nil
 end)
 
-local BringCard = FarmAdvancedPage:CreateSection("Bring Mobs")
+PlatformCard:AddSlider("Platform Size", 5, 14, Config.PlatformSize, function(value)
+    Config.PlatformSize = value
+end)
 
-BringCard:AddToggle("Bring Mobs", false, function(value)
+PlatformCard:AddSlider(
+    "Platform Transparency x10",
+    0,
+    10,
+    math.floor(Config.PlatformTransparency * 10),
+    function(value)
+        Config.PlatformTransparency = value / 10
+    end
+)
+
+PlatformCard:AddButton("Destroy Platform", function()
+    PlatformTransport.Cancel(false)
+end)
+
+local BringCard = BringPage:CreateSection("Quest Mob Bring")
+
+BringCard:AddToggle("Bring Matching Mobs", true, function(value)
     Config.BringMobs = value
-end, {
-    Title = "Bring Mobs",
-    Description = "Best-effort client stacking các mob phù hợp gần người chơi. Không ép network ownership hay gọi remote đoán.",
-})
+end)
 
-BringCard:AddSlider("Bring Radius", 20, 200, Config.BringRadius, function(value)
+BringCard:AddSlider("Bring Radius", 25, 220, Config.BringRadius, function(value)
     Config.BringRadius = value
 end)
 
-BringCard:AddSlider("Mob Limit", 1, 20, Config.BringLimit, function(value)
+BringCard:AddSlider("Bring Limit", 1, 20, Config.BringLimit, function(value)
     Config.BringLimit = value
 end)
 
-BringCard:AddSlider("Stack Distance", 2, 12, Config.BringDistance, function(value)
-    Config.BringDistance = value
+BringCard:AddSlider("Below Feet", 4, 14, Config.MobBelowFeet, function(value)
+    Config.MobBelowFeet = value
 end)
 
-BringCard:AddToggle("Allow Bring Boss", false, function(value)
+BringCard:AddToggle("Bring Bosses", false, function(value)
     Config.BringBosses = value
 end)
 
--- ============================================================
--- 💀 Combat
--- ============================================================
+local HitboxCard = BringPage:CreateSection("Mob Hitbox Only")
 
-local CombatTab = Window:CreateTab("💀 Combat", false, false)
+HitboxCard:AddToggle("Mob Hitbox", true, function(value)
+    Config.MobHitbox = value
+
+    if not value then
+        HitboxService.Clear()
+    end
+end, {
+    Title = "Mob-only Hitbox",
+    Description = "Chỉ áp dụng lên alive combat mob phù hợp target. Player, civilian và dialogue NPC bị loại.",
+})
+
+HitboxCard:AddSlider("Hitbox Size", 4, 18, Config.HitboxSize, function(value)
+    Config.HitboxSize = value
+end)
+
+HitboxCard:AddSlider(
+    "Hitbox Transparency x10",
+    0,
+    10,
+    math.floor(Config.HitboxTransparency * 10),
+    function(value)
+        Config.HitboxTransparency = value / 10
+    end
+)
+
+HitboxCard:AddToggle("Hitbox Bosses", false, function(value)
+    Config.HitboxBosses = value
+end)
+
+local WeaponCard = MasteryPage:CreateSection("Weapon / Skill")
+
+local weaponOptions = HotbarService.GetWeaponOptions()
+
+WeaponCard:AddDropdown("Selected Weapon", weaponOptions, false, function(value)
+    Config.SelectedWeapon = value
+end)
+
+WeaponCard:AddButton("Show Hotbar", function()
+    notify("Hotbar", HotbarService.GetSnapshot(), 8)
+end)
+
+local MasteryCard = MasteryPage:CreateSection("Auto Mastery")
+
+MasteryCard:AddToggle("Auto Farm Mastery", false, function(value)
+    Config.AutoMastery = value
+end, {
+    Title = "Auto Mastery",
+    Description = "Trong lúc farm, tự cycle các skill hotbar đang ready để kiếm Skill EXP thay vì chỉ spam một slot.",
+})
+
+MasteryCard:AddDropdown(
+    "Mastery Mode",
+    {"Combat Skills", "Current Fruit", "Selected Skill"},
+    false,
+    function(value)
+        Config.MasteryMode = value
+        Runtime.MasteryCursor = 0
+    end
+)
+
+MasteryCard:AddSlider(
+    "Mastery Interval x100",
+    15,
+    150,
+    math.floor(Config.MasteryInterval * 100),
+    function(value)
+        Config.MasteryInterval = value / 100
+    end
+)
+
+MasteryCard:AddToggle("Ready Skills Only", true, function(value)
+    Config.MasteryReadyOnly = value
+end)
+
+MasteryCard:AddButton("Show Mastery Candidates", function()
+    notify("Mastery", MasteryService.GetSnapshot(), 10)
+end)
+
+-- ---------------- Combat ----------------
+
+local CombatTab = Window:CreateTab("☠ Combat", false, false)
 local CombatPage = CombatTab:CreatePage("Chiến Đấu")
 
-local CombatCard = CombatPage:CreateSection("Combat Assist")
+local CombatCard = CombatPage:CreateSection("Combat")
 
-CombatCard:AddToggle("Auto Aim Target", true, function(value)
+CombatCard:AddToggle("Auto Aim", true, function(value)
     Config.AutoAim = value
 end)
 
-CombatCard:AddToggle("Boss Priority", false, function(value)
-    Config.AutoBoss = value
-
-    if value and Config.AutoFarm then
-        Config.FarmMode = "Boss"
-    end
-end)
-
-CombatCard:AddSlider("Combat Distance", 3, 15, Config.CombatDistance, function(value)
-    Config.CombatDistance = value
-end)
-
-CombatCard:AddSlider("Farm Height", 0, 14, Config.FarmHeight, function(value)
-    Config.FarmHeight = value
-end)
-
-CombatCard:AddSlider("Farm Back", 0, 12, Config.FarmBack, function(value)
-    Config.FarmBack = value
-end)
-
-local DefenseCard = CombatPage:CreateSection("Defense")
-
-DefenseCard:AddToggle("Auto Block Low HP", false, function(value)
+CombatCard:AddToggle("Auto Block Low HP", false, function(value)
     Config.AutoBlock = value
+
     if not value then
         setBlock(false)
     end
-end, {
-    Title = "Auto Block",
-    Description = "Game tutorial trong dump xác nhận block dùng phím F. Hub chỉ giữ F khi HP thấp và target đang gần.",
-})
-
-DefenseCard:AddSlider("Block Below HP %", 10, 80, Config.BlockHealthPercent, function(value)
-    Config.BlockHealthPercent = value
 end)
 
-local CombatESPCard = CombatPage:CreateSection("Target Visual")
+CombatCard:AddSlider(
+    "Block Below HP %",
+    10,
+    80,
+    Config.BlockHealthPercent,
+    function(value)
+        Config.BlockHealthPercent = value
+    end
+)
+
+local CombatESPCard = CombatPage:CreateSection("ESP")
 
 CombatESPCard:AddToggle("Current Target ESP", true, function(value)
-    Config.QuestTargetESP = value
+    Config.CurrentTargetESP = value
 end)
 
 CombatESPCard:AddToggle("Mob ESP", false, function(value)
@@ -2554,41 +4708,36 @@ CombatESPCard:AddToggle("Boss ESP", false, function(value)
     Config.BossESP = value
 end)
 
--- ============================================================
--- 🏃 Movement
--- ============================================================
+-- ---------------- Movement ----------------
 
-local MovementTab = Window:CreateTab("🏃 Movement", false, false)
-local TweenPage = MovementTab:CreatePage("Tween")
+local MovementTab = Window:CreateTab("➤ Movement", false, false)
+local TransportPage = MovementTab:CreatePage("Platform")
 local CharacterPage = MovementTab:CreatePage("Character")
 
-local TweenCard = TweenPage:CreateSection("Tween Controller")
+local TransportCard = TransportPage:CreateSection("Transport Status")
 
-TweenCard:AddToggle("Tween Movement", true, function(value)
-    Config.TweenEnabled = value
+TransportCard:AddButton("Re-seat Platform Under Feet", function()
+    PlatformTransport.Cancel(false)
+    PlatformTransport.Ensure()
+end)
 
-    if not value then
-        TweenController.Cancel()
+TransportCard:AddToggle("Movement Noclip", true, function(value)
+    Config.PlatformNoclip = value
+end)
+
+TransportCard:AddSlider(
+    "Arrival Distance",
+    2,
+    12,
+    Config.PlatformArrivalDistance,
+    function(value)
+        Config.PlatformArrivalDistance = value
     end
-end)
+)
 
-TweenCard:AddSlider("Tween Speed", 50, 450, Config.TweenSpeed, function(value)
-    Config.TweenSpeed = value
-end)
+local CharacterCard = CharacterPage:CreateSection("Character")
 
-TweenCard:AddSlider("Arrival Distance", 3, 15, Config.ArrivalDistance, function(value)
-    Config.ArrivalDistance = value
-end)
-
-TweenCard:AddToggle("Tween Noclip", true, function(value)
-    Config.TweenNoclip = value
-end)
-
-TweenCard:AddButton("Stop Current Tween", TweenController.Cancel)
-
-local CharacterCard = CharacterPage:CreateSection("Movement Overrides")
-
-CharacterCard:AddToggle("WalkSpeed", false, function(value)
+CharacterCard:AddToggle("WalkSpeed Override", false, function(value)
     Config.SpeedOverride = value
 end)
 
@@ -2611,20 +4760,46 @@ end)
 CharacterCard:AddToggle("Noclip", false, function(value)
     Config.Noclip = value
 
-    if not value and Runtime.CurrentTween == nil then
+    if not value and not Runtime.TransportMoving then
         restoreCollision()
     end
 end)
 
--- ============================================================
--- 👤 Player
--- ============================================================
+-- ---------------- Player ----------------
 
-local PlayerTab = Window:CreateTab("👤 Player", false, false)
+local PlayerTab = Window:CreateTab("☺ Player", false, false)
+local StatsPage = PlayerTab:CreatePage("Stats")
 local LootPage = PlayerTab:CreatePage("Loot")
 local LifePage = PlayerTab:CreatePage("Life Skills")
 
-local LootCard = LootPage:CreateSection("Automatic Loot")
+local StatsCard = StatsPage:CreateSection("Auto Stats")
+
+StatsCard:AddToggle("Auto Stats", false, function(value)
+    Config.AutoStats = value
+end)
+
+StatsCard:AddDropdown(
+    "Stat Build",
+    {
+        "Auto Weapon",
+        "Balanced",
+        "Strength",
+        "Precision",
+        "Tank",
+        "Mobility",
+        "Haki",
+    },
+    false,
+    function(value)
+        Config.StatBuild = value
+    end
+)
+
+StatsCard:AddButton("Show Stats", function()
+    notify("Stats", StatsService.GetSnapshot(), 9)
+end)
+
+local LootCard = LootPage:CreateSection("Loot")
 
 LootCard:AddToggle("Auto Pickup", false, function(value)
     Config.AutoPickup = value
@@ -2636,10 +4811,7 @@ end)
 
 LootCard:AddToggle("Auto World Boss Chest", false, function(value)
     Config.AutoWorldBossChest = value
-end, {
-    Title = "World Boss Chest",
-    Description = "Dump có WorldBossChestHandler và prompt World Boss Chest riêng.",
-})
+end)
 
 LootCard:AddToggle("Auto Fruit Chest", false, function(value)
     Config.AutoFruitChest = value
@@ -2653,55 +4825,177 @@ LootCard:AddToggle("Loot ESP", false, function(value)
     Config.LootESP = value
 end)
 
-local LifeCard = LifePage:CreateSection("Lifeskills")
+local FishingCard = LifePage:CreateSection("Fishing")
 
-LifeCard:AddToggle("Auto Mining", false, function(value)
-    Config.AutoMining = value
+FishingCard:AddToggle("Auto Fishing", false, function(value)
+    Config.AutoFishing = value
+    FishingService.Reset(value and "Enabled" or "Disabled")
+end)
+
+FishingCard:AddDropdown(
+    "Fishing Spot",
+    {"Saved Position", "Anchor Town Pond", "Current Position"},
+    false,
+    function(value)
+        Config.FishingSpotMode = value
+        FishingService.Reset("Spot changed")
+    end
+)
+
+FishingCard:AddButton("Save Current Fishing Spot", function()
+    local root = rootPart()
+
+    if root then
+        Runtime.FishingSpotCFrame = root.CFrame
+        Config.FishingSpotMode = "Saved Position"
+        FishingService.Reset("Saved current spot")
+        notify("Fishing", "Current fishing spot saved.", 3)
+    end
+end)
+
+FishingCard:AddToggle("Auto Return To Spot", true, function(value)
+    Config.FishingAutoReturn = value
+end)
+
+FishingCard:AddToggle("Require Bait", false, function(value)
+    Config.FishingRequireBait = value
+end)
+
+FishingCard:AddToggle("Auto SHAKE", true, function(value)
+    Config.FishingAutoShake = value
+end)
+
+FishingCard:AddToggle("Auto CLICK Spam", true, function(value)
+    Config.FishingAutoSpamClick = value
+end)
+
+FishingCard:AddToggle("Auto Timed Release", true, function(value)
+    Config.FishingAutoTimedRelease = value
+end)
+
+FishingCard:AddSlider(
+    "Release Threshold %",
+    70,
+    99,
+    math.floor(Config.FishingReleaseThreshold * 100),
+    function(value)
+        Config.FishingReleaseThreshold = value / 100
+    end
+)
+
+FishingCard:AddSlider(
+    "Reel Tolerance",
+    5,
+    40,
+    Config.FishingReelTolerance,
+    function(value)
+        Config.FishingReelTolerance = value
+    end
+)
+
+FishingCard:AddToggle("Auto Calibrate Reel Direction", true, function(value)
+    Config.FishingAutoCalibrate = value
+    Runtime.FishingReelCalibrated = false
 end, {
-    Title = "Auto Mining",
-    Description = "Tự tìm Ore prompt và ưu tiên Rusty Pickaxe / hotbar pickaxe nếu có.",
+    Title = "Hold / Release Reel Calibration",
+    Description = "Move là thanh lớn, Fish là cục mục tiêu. Hub tự thử HOLD ngắn để biết HOLD đẩy thanh sang trái hay phải rồi giữ Fish nằm trong Move.",
 })
 
-LifeCard:AddToggle("Auto Farming", false, function(value)
+FishingCard:AddButton("Check Fishing Conditions", function()
+    local c = FishingService.GetConditions()
+
+    notify(
+        "Fishing Conditions",
+        table.concat({
+            "State: " .. tostring(c.State),
+            "Can Start: " .. tostring(c.CanStart),
+            "Rod: " .. tostring(c.Rod)
+                .. " [" .. tostring(c.RodSource) .. "]",
+            "Bait: " .. tostring(c.Bait)
+                .. " x" .. tostring(c.BaitAmount),
+            "Bait Required: " .. tostring(c.BaitRequired),
+            "Spot: " .. tostring(c.Spot),
+            "Reason: " .. tostring(c.Reason),
+        }, "\n"),
+        10
+    )
+end)
+
+local MiningCard = LifePage:CreateSection("Mining / Farming")
+
+MiningCard:AddToggle("Auto Mining", false, function(value)
+    Config.AutoMining = value
+    MiningQTEService.Reset(value and "Enabled" or "Disabled")
+end, {
+    Title = "Auto Mining",
+    Description = "Chọn đúng Ore model theo attribute Ore/Name, đi tới khoáng sản, equip pickaxe, HOLD chuột và RELEASE trong Critical Zone.",
+})
+
+MiningCard:AddDropdown(
+    "Mining Mode",
+    {"Quest Required", "Selected Ore", "Any Available", "Highest Drop"},
+    false,
+    function(value)
+        Config.MiningMode = value
+        MiningQTEService.Reset("Mining mode changed")
+    end
+)
+
+MiningCard:AddDropdown(
+    "Select Ore",
+    {"Copper Ore", "Iron Ore", "Silver Ore", "Gold Ore", "Diamond Ore"},
+    false,
+    function(value)
+        Config.SelectedOre = value
+        MiningQTEService.Reset("Ore selection changed")
+    end,
+    {
+        Title = "Ore Type",
+        Description = "Game dump xác nhận Copper/Iron/Silver/Gold/Diamond Ore. Snapshot hiện có Copper + Iron đang spawn.",
+    }
+)
+
+MiningCard:AddToggle("Auto Mining QTE", true, function(value)
+    Config.AutoMiningQTE = value
+end)
+
+MiningCard:AddButton("Show Mining State", function()
+    local target = Runtime.MiningTarget
+    notify(
+        "Mining",
+        table.concat({
+            "State: " .. tostring(Runtime.MiningState),
+            "Mode: " .. tostring(Config.MiningMode),
+            "Wanted: " .. tostring(MiningQTEService.GetWantedOre() or "Any"),
+            "Target: " .. tostring(target and oreName(target) or "None"),
+            "DropAmount: " .. tostring(target and target:GetAttribute("DropAmount") or "-"),
+            "Mined: " .. tostring(target and target:GetAttribute("Mined") or "-"),
+        }, "\n"),
+        8
+    )
+end)
+
+MiningCard:AddToggle("Auto Farming", false, function(value)
     Config.AutoFarming = value
 end)
 
-LifeCard:AddToggle("Auto Fishing", false, function(value)
-    Config.AutoFishing = value
-    Runtime.LastFishingCast = 0
-end, {
-    Title = "Auto Fishing",
-    Description = "Dùng PlayerGui.Fishing/Main/Move + Fish để tự điều khiển minigame khi UI đang active.",
-})
+local UtilityCard = LifePage:CreateSection("Utility")
 
-LifeCard:AddButton("Tween Nearest Treasure DigSpot", function()
-    LifeSkillService.TweenNearestDigSpot()
-end, {
-    Title = "Treasure Helper",
-    Description = "Dump có TreasureMapLocations/DigSpots trên các island; nút này Tween tới DigSpot gần nhất.",
-})
-
-local PlayerUtilityCard = LifePage:CreateSection("Player Utility")
-
-PlayerUtilityCard:AddToggle("Anti AFK", true, function(value)
+UtilityCard:AddToggle("Anti AFK", true, function(value)
     Config.AntiAFK = value
 end)
 
--- ============================================================
--- 📜 Quest
--- ============================================================
+-- ---------------- Quest ----------------
 
-local QuestTab = Window:CreateTab("📜 Quest", false, false)
-local QuestPage = QuestTab:CreatePage("Nhiệm Vụ")
+local QuestTab = Window:CreateTab("✦ Quest", false, false)
+local CurrentQuestPage = QuestTab:CreatePage("Current")
+local CatalogPage = QuestTab:CreatePage("Catalog")
 
-local QuestCard = QuestPage:CreateSection("Quest Automation")
+local QuestCard = CurrentQuestPage:CreateSection("Automation")
 
 QuestCard:AddToggle("Auto Quest", true, function(value)
     Config.AutoQuest = value
-end, {
-    Title = "Auto Quest",
-    Description = "Đọc trực tiếp PlayerGui.Quests: QuestId, QuestName, Task progress và RecommendedQuest.",
-})
+end)
 
 QuestCard:AddToggle("Auto Accept Recommended", true, function(value)
     Config.AutoAcceptRecommended = value
@@ -2715,78 +5009,108 @@ QuestCard:AddToggle("Auto Dialogue", true, function(value)
     Config.AutoDialogue = value
 end)
 
-QuestCard:AddToggle("Auto Claim Reward", true, function(value)
+QuestCard:AddToggle("Auto Claim", true, function(value)
     Config.AutoClaim = value
 end)
 
-local QuestStatusCard = QuestPage:CreateSection("Quest State")
+local QuestStatusCard = CurrentQuestPage:CreateSection("State")
 
 QuestStatusCard:AddButton("Show Current Quest", function()
     notify(
-        "Quest State",
-        "Level: " .. PlayerState.GetLevel()
+        "Quest",
+        "Lv." .. tostring(PlayerState.GetLevel())
             .. "\n"
-            .. currentQuestText()
-            .. "\nRecommended: "
-            .. tostring((QuestService.GetRecommended() or {}).Name or "None"),
-        7
+            .. currentQuestSummary()
+            .. "\nWorker: "
+            .. Runtime.ProgressState
+            .. " • "
+            .. Runtime.ProgressDetail,
+        10
     )
 end)
 
-QuestStatusCard:AddButton("Tween To Current Quest Target", function()
-    local quest, taskData = QuestService.GetNextTask()
+QuestStatusCard:AddButton("Rebuild Quest NPC Map", function()
+    QuestCatalogService.Build()
 
-    if not quest or not taskData then
-        notify("Quest", "Không có task chưa hoàn thành.", 3)
-        return
+    notify(
+        "Quest Map",
+        tostring(#Runtime.QuestCatalog)
+            .. " quest modules indexed.",
+        4
+    )
+end)
+
+if #Runtime.QuestCatalog == 0 then
+    QuestCatalogService.Build()
+end
+
+local questCatalogOptions = QuestCatalogService.GetNames()
+local selectedQuestPath = questCatalogOptions[1]
+
+local CatalogCard = CatalogPage:CreateSection("All Game Quests")
+
+CatalogCard:AddDropdown(
+    "Quest Catalog",
+    questCatalogOptions,
+    false,
+    function(value)
+        selectedQuestPath = value
     end
+)
 
-    local target
+CatalogCard:AddButton("Find Quest Giver", function()
+    local questName = tostring(selectedQuestPath):match("([^/]+)$")
+        or tostring(selectedQuestPath)
 
-    if taskData.Kind == "Defeat" then
-        target = TargetService.Find(taskData.Target)
-    elseif taskData.Kind == "Talk" or taskData.Kind == "Return" then
-        target = QuestService.FindDialogueNPC(quest.Name, taskData.Target)
-            or TargetService.Find(taskData.Target)
+    local npc = QuestCatalogService.FindQuestGiver(questName)
+
+    if npc then
+        Runtime.CurrentTarget = npc
+        PlatformTransport.MoveNear(npc)
+        notify("Quest Giver", questName .. " → " .. npc.Name, 5)
     else
-        target = InteractionService.FindPromptByText(taskData.Target)
-            or TargetService.Find(taskData.Target)
-    end
-
-    if target then
-        Runtime.CurrentTarget = target
-        Runtime.CurrentTargetReason = taskData.Text
-        TweenController.MoveTo(target)
-    else
-        notify("Quest", "Chưa resolve được target: " .. taskData.Target, 3)
+        notify("Quest Giver", "No mapped NPC for " .. questName, 4)
     end
 end)
 
--- ============================================================
--- ⚙️ Settings
--- ============================================================
+CatalogCard:AddCopyButton(
+    "Quest Count",
+    tostring(#Runtime.QuestCatalog),
+    {
+        Title = "Quest Catalog",
+        Description = "Quest modules discovered from ReplicatedStorage.Modules.QuestInfo.Quests.",
+    }
+)
 
-local SettingsTab = Window:CreateTab("⚙️ Settings", false, false)
+-- ---------------- Settings ----------------
+
+local SettingsTab = Window:CreateTab("✧ Settings", false, false)
 local SettingsPage = SettingsTab:CreatePage("Cài Đặt")
 
-local UISettingsCard = SettingsPage:CreateSection("Interface")
+local InterfaceCard = SettingsPage:CreateSection("Interface")
 
-UISettingsCard:AddToggle("Glass UI", false, function(value)
+InterfaceCard:AddToggle("Glass UI", false, function(value)
     Window:SetTransparency(value and 0.18 or 0)
 end)
 
 local ConfigCard = SettingsPage:CreateSection("Config")
-ConfigCard:AddConfigManager("son_hub_v3")
+ConfigCard:AddConfigManager("son_hub_v6")
 
 local RuntimeCard = SettingsPage:CreateSection("Runtime")
 
-RuntimeCard:AddButton("Rebuild Game Index", function()
-    task.spawn(function()
-        notify("SON HUB", "Rebuilding Explorer cache...", 2)
-        RuntimeIndex.Rebuild()
-        HotbarService.Refresh()
-        notify("SON HUB", "Runtime index rebuilt.", 2)
-    end)
+RuntimeCard:AddButton("Reset Automation State", function()
+    PlatformTransport.Cancel(false)
+    HitboxService.Clear()
+
+    Runtime.ProgressQuestKey = nil
+    Runtime.FarmAnchorCFrame = nil
+    Runtime.CurrentTarget = nil
+    Runtime.CurrentWantedMob = nil
+
+    FishingService.Reset("Manual reset")
+    MiningQTEService.Reset("Manual reset")
+
+    notify("SON HUB", "Automation state reset.", 3)
 end)
 
 RuntimeCard:AddButton("Unload SON HUB", function()
@@ -2795,37 +5119,32 @@ RuntimeCard:AddButton("Unload SON HUB", function()
     end
 end)
 
--- ============================================================
--- ℹ️ Info
--- ============================================================
+-- ---------------- Info ----------------
 
-local InfoTab = Window:CreateTab("ℹ️ Info", false, false)
+local InfoTab = Window:CreateTab("❖ Info", false, false)
 local InfoPage = InfoTab:CreatePage("Thông Tin")
 
 local AboutCard = InfoPage:CreateSection("SON HUB")
 
-AboutCard:AddCopyButton("Version", VERSION, {
-    Title = "SON HUB",
-    Description = "make by hongson • clean / no console spam",
-})
-
+AboutCard:AddCopyButton("Version", VERSION)
 AboutCard:AddCopyButton("Target PlaceId", tostring(EXPECTED_PLACE_ID))
+AboutCard:AddCopyButton("Icon URL", SON_ICON_URL)
 
-AboutCard:AddButton("Show Detected Game Systems", function()
-    notify("Detected Systems", detectedSystems(), 10)
+AboutCard:AddButton("Show Detected Systems", function()
+    notify("Detected Systems", detectedSystems(), 12)
 end)
 
-AboutCard:AddButton("Show Full Runtime Status", function()
-    notify("SON HUB • Runtime", homeStatus(), 10)
+AboutCard:AddButton("Show Full Runtime", function()
+    notify("SON HUB", runtimeStatus(), 12)
 end)
 
-local SourceCard = InfoPage:CreateSection("Dump Basis")
+local LimitCard = InfoPage:CreateSection("Snapshot Limits")
 
-SourceCard:AddButton("Snapshot Information", function()
+LimitCard:AddButton("Source Availability", function()
     notify(
         "DexBridge Snapshot",
-        "232,910 Instances\n27,826 UI objects\n31,197 script objects\n0 script source files\nMode: balanced",
-        7
+        "232,910 Instances\n27,826 UI objects\n31,197 script objects\n0 script source files\n\nQuest/UI/object logic is mapped from client-visible structures; hidden remote contracts are not guessed.",
+        10
     )
 end)
 
@@ -2839,11 +5158,16 @@ local function unload()
     end
 
     Core.Running = false
-    Config.AutoFarm = false
-    Config.BringMobs = false
+    Config.AutoProgress = false
+    Config.AutoFishing = false
+    Config.AutoStats = false
 
     setBlock(false)
-    TweenController.Cancel()
+    releaseFishingKey()
+    setFishingMouseHeld(false)
+
+    PlatformTransport.Cancel(false)
+    HitboxService.Clear()
     restoreCollision()
 
     for _, connection in ipairs(Core.Connections) do
@@ -2860,7 +5184,9 @@ local function unload()
 
     for _, instance in ipairs(Core.Instances) do
         pcall(function()
-            instance:Destroy()
+            if instance and instance.Parent then
+                instance:Destroy()
+            end
         end)
     end
 
@@ -2876,6 +5202,7 @@ ENV.__SON_HUB_UNLOAD = unload
 
 task.defer(function()
     HotbarService.Refresh()
+    QuestCatalogService.Build()
 
     local mismatch = game.PlaceId ~= EXPECTED_PLACE_ID
     local prefix = mismatch
@@ -2883,14 +5210,15 @@ task.defer(function()
         or ""
 
     notify(
-        "SON HUB Ready",
+        "SON HUB v6 Ready",
         prefix
             .. "Lv."
-            .. PlayerState.GetLevel()
+            .. tostring(PlayerState.GetLevel())
             .. " • "
             .. PlayerState.GetFruit()
             .. " • "
-            .. currentQuestText(),
+            .. tostring(#Runtime.QuestCatalog)
+            .. " quests indexed",
         6
     )
 end)
