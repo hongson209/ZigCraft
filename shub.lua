@@ -1,10 +1,12 @@
 --[[
-	Dex++
-	Version 3.0
-	
-	Developed by Chillz
-	
-	Dex++ is a revival of Moon's Dex, made to fulfill Moon's Dex prophecy.
+	Dex++ hongson Edition
+	Version 3.2 - Claude Code Full Context
+
+	Cleaned & modified by hongson
+	Based on Dex++ 3.0
+
+	Claude Code bridge integration, custom Anthropic-compatible endpoint support,
+	and local workspace export via the bundled Windows .bat bridge.
 ]]
 
 local selection
@@ -14084,16 +14086,19 @@ else
 	return {InitDeps = initDeps, InitAfterMain = initAfterMain, Main = main}
 end
 end,
-["Codex"] = function()
+["ClaudeCode"] = function()
 --[[
-    Dex++ Codex Integration
-    Read-only Dex context bridge for authorized / educational environments.
+    Dex++ Claude Code Integration v5 - make by hongson
+
+    Compatibility note:
+      The embedded module key remains "ClaudeCode" because the legacy Dex++ loader
+      references Apps.ClaudeCode. User-facing behavior is Claude Code only.
 
     Transport:
-      Dex++ (Luau) -> HTTP localhost bridge -> `codex app-server` (stdio JSONL)
+      Dex++ (Luau) -> localhost bridge -> Claude Code CLI -> local workspace
 
-    The bridge never receives Roblox credentials. Codex authentication remains
-    owned by the locally installed Codex CLI / ChatGPT session.
+    API credentials stay in the local bridge process. Dex++ only talks to
+    127.0.0.1 and never stores the Claude API token in this Luau source.
 ]]
 
 local Main,Lib,Apps,Settings
@@ -14121,16 +14126,13 @@ local function initAfterMain()
 end
 
 local function main()
-    local Codex = {}
+    local ClaudeCode = {}
     local HttpService = service.HttpService
     local window
     local statusLabel, contextLabel, messages, inputBox, sendButton
     local syncButton, deepSyncButton, newThreadButton
-    local codexProviderButton, freebuffProviderButton, freebuffCheckButton
+    local claudeProviderButton, openClaudeButton, openWorkspaceButton
     local busy = false
-    local lastFreebuffResponseId = nil
-    local provider = tostring((Settings.Codex and Settings.Codex.Provider) or "Codex")
-    if provider ~= "Freebuff" then provider = "Codex" end
     local pathIndex = setmetatable({}, {__mode = "v"})
     local hasFullSnapshot = false
     local lastFullSync = 0
@@ -14143,13 +14145,16 @@ local function main()
     local liveRevision = 0
     local submitSerial = 0
     local composerHeight = 40
+    local startupResearchDone = false
+    local startupResearchRunning = false
+    local lastMirroredRevision = -1
 
-    Codex.Version = "1.6.2"
-    Codex.Window = nil
-    Codex.LastSnapshotStats = nil
+    ClaudeCode.Version = "5.0.0-hongson"
+    ClaudeCode.Window = nil
+    ClaudeCode.LastSnapshotStats = nil
 
     local function cfg(name, fallback)
-        local c = Settings.Codex or {}
+        local c = Settings.ClaudeCode or {}
         local value = c[name]
         if value == nil then return fallback end
         return value
@@ -14184,7 +14189,7 @@ local function main()
             Method = method or "GET",
             Headers = {
                 ["Content-Type"] = "application/json",
-                ["X-Dex-Codex-Client"] = "Dex++/" .. tostring(Codex.Version),
+                ["X-Dex-ClaudeCode-Client"] = "Dex++/" .. tostring(ClaudeCode.Version),
             },
         }
 
@@ -14527,24 +14532,29 @@ local function main()
     end
 
     local function collectRoots(includeNil)
-        if includeNil ~= true and liveRootsCache and not liveRootsDirty then
-            return liveRootsCache
-        end
-
-        local roots = {game}
-        local ok, descendants = pcall(game.GetDescendants, game)
-        if ok and type(descendants) == "table" then
-            for i = 1, #descendants do roots[#roots + 1] = descendants[i] end
-        end
-
-        if includeNil and env.getnilinstances then
-            local okNil, nils = pcall(env.getnilinstances)
-            if okNil and type(nils) == "table" then
-                for i = 1, #nils do roots[#roots + 1] = nils[i] end
+        -- Cache the live DataModel tree independently from nil instances. Nil instances
+        -- are appended on demand because they are executor-provided and have no reliable
+        -- DescendantAdded/Removing signal. This keeps liveRootsDirty meaningful even when
+        -- MirrorIncludeNilInstances is enabled.
+        local liveRoots = liveRootsCache
+        if not liveRoots or liveRootsDirty then
+            liveRoots = {game}
+            local ok, descendants = pcall(game.GetDescendants, game)
+            if ok and type(descendants) == "table" then
+                for i = 1, #descendants do liveRoots[#liveRoots + 1] = descendants[i] end
             end
-        elseif includeNil ~= true then
-            liveRootsCache = roots
+            liveRootsCache = liveRoots
             liveRootsDirty = false
+        end
+
+        if includeNil ~= true or not env.getnilinstances then
+            return liveRoots
+        end
+
+        local roots = table.clone(liveRoots)
+        local okNil, nils = pcall(env.getnilinstances)
+        if okNil and type(nils) == "table" then
+            for i = 1, #nils do roots[#roots + 1] = nils[i] end
         end
         return roots
     end
@@ -14574,7 +14584,7 @@ local function main()
         }
     end
 
-    function Codex.ResolvePath(path)
+    function ClaudeCode.ResolvePath(path)
         if typeof(path) == "Instance" then return path end
         path = tostring(path or "")
         if path == "" then return nil end
@@ -14607,7 +14617,7 @@ local function main()
         return {ok = false, error = tostring(message)}
     end
 
-    function Codex.ExecuteQuery(query)
+    function ClaudeCode.ExecuteQuery(query)
         if type(query) ~= "table" then return queryError("query must be an object") end
         local op = tostring(query.op or query.operation or "")
         local args = type(query.args) == "table" and query.args or query
@@ -14615,7 +14625,7 @@ local function main()
         local offset = math.max(0, math.floor(tonumber(args.offset) or 0))
 
         if op == "get_selection" then
-            return {ok = true, data = Codex.BuildSelectionContext()}
+            return {ok = true, data = ClaudeCode.BuildSelectionContext()}
         elseif op == "list_services" then
             local out = {}
             local children = game:GetChildren()
@@ -14697,7 +14707,7 @@ local function main()
         end
 
         local path = args.path or query.path
-        local obj = Codex.ResolvePath(path)
+        local obj = ClaudeCode.ResolvePath(path)
         if not obj then return queryError("instance not found: " .. tostring(path)) end
 
         if op == "get_instance" or op == "get_object" then
@@ -14790,18 +14800,18 @@ local function main()
         return queryError("unsupported Dex operation: " .. op)
     end
 
-    function Codex.ExecuteQueries(queries)
+    function ClaudeCode.ExecuteQueries(queries)
         if type(queries) ~= "table" then return {queryError("queries must be an array")} end
         local out = {}
         local maxBatch = math.clamp(tonumber(cfg("MaxToolBatch", 8)) or 8, 1, 16)
         for i = 1, math.min(#queries, maxBatch) do
-            out[i] = Codex.ExecuteQuery(queries[i])
+            out[i] = ClaudeCode.ExecuteQuery(queries[i])
             if i % 2 == 0 then task.wait() end
         end
         return out
     end
 
-    function Codex.BuildSelectionContext(includeDetails, includeSource)
+    function ClaudeCode.BuildSelectionContext(includeDetails, includeSource)
         local selected = {}
         local selectionList = Explorer and Explorer.Selection and Explorer.Selection.List or {}
         local maxSelected = math.min(#selectionList, tonumber(cfg("MaxSelectedInstances", 20)) or 20)
@@ -14898,7 +14908,7 @@ local function main()
     -- Creates a disk-backed mirror of every Instance currently visible to Dex.
     -- Unlike BuildFullSnapshot, this has no artificial instance count cap.
     -- Data is uploaded in small chunks so large places do not require one huge HTTP body.
-    function Codex.SyncExplorerMirror(includeSources, includeProperties)
+    function ClaudeCode.SyncExplorerMirror(includeSources, includeProperties)
         if not env.request then return false, "Executor does not expose an HTTP request function." end
 
         local started = os.clock()
@@ -14915,7 +14925,7 @@ local function main()
             placeId = game.PlaceId,
             jobId = game.JobId,
             dexVersion = tostring(Main.Version),
-            integrationVersion = Codex.Version,
+            integrationVersion = ClaudeCode.Version,
             includeSources = includeSources == true,
             includeProperties = includeProperties == true,
             includeNilInstances = includeNil,
@@ -15039,7 +15049,7 @@ local function main()
         return true, endResult
     end
 
-    function Codex.BuildFullSnapshot(includeSources)
+    function ClaudeCode.BuildFullSnapshot(includeSources)
         local started = os.clock()
         local maxInstances = tonumber(cfg("CompactContextMaxInstances", 2500)) or 2500
         local maxScripts = tonumber(cfg("CompactContextMaxScripts", 0)) or 0
@@ -15080,7 +15090,7 @@ local function main()
             end
         end
 
-        local selectionContext = Codex.BuildSelectionContext()
+        local selectionContext = ClaudeCode.BuildSelectionContext()
         local snapshot = {
             schema = "dexpp.snapshot.v1",
             timestamp = os.time(),
@@ -15088,7 +15098,7 @@ local function main()
             jobId = game.JobId,
             gameName = "",
             dexVersion = tostring(Main.Version),
-            codexIntegrationVersion = Codex.Version,
+            claudeCodeIntegrationVersion = ClaudeCode.Version,
             instanceCount = #instances,
             instancesTruncated = truncated,
             sourceSyncEnabled = includeSources and true or false,
@@ -15102,7 +15112,7 @@ local function main()
             snapshot.gameName = service.MarketplaceService:GetProductInfo(game.PlaceId).Name
         end)
 
-        Codex.LastSnapshotStats = {
+        ClaudeCode.LastSnapshotStats = {
             instances = #instances,
             scripts = #scripts,
             seconds = os.clock() - started,
@@ -15120,8 +15130,8 @@ local function main()
         return ok, result
     end
 
-    function Codex.SyncSelection()
-        local context = Codex.BuildSelectionContext()
+    function ClaudeCode.SyncSelection()
+        local context = ClaudeCode.BuildSelectionContext()
         local ok, result = syncPayload("selection", context)
         if ok then
             contextLabel.Text = string.format("Selection synced: %d object(s)", context.selectedCount)
@@ -15129,15 +15139,15 @@ local function main()
         return ok, result
     end
 
-    function Codex.SyncFull(includeSources)
+    function ClaudeCode.SyncFull(includeSources)
         if busy then return false, "busy" end
         busy = true
 
-        -- IMPORTANT: the disk mirror is the source of truth for BOTH providers.
+        -- IMPORTANT: the disk mirror is the source of truth for Claude Code.
         -- Mirror first and never block a full Explorer sync just because the optional
-        -- compact Codex chat snapshot fails (large executors often reject a big /sync body).
+        -- compact Claude Code chat snapshot fails (large executors often reject a big /sync body).
         setStatus(includeSources and "Deep mirroring full Explorer..." or "Mirroring full Explorer...", nil)
-        local mirrorOk, mirrorResult = Codex.SyncExplorerMirror(includeSources == true, includeSources == true)
+        local mirrorOk, mirrorResult = ClaudeCode.SyncExplorerMirror(includeSources == true, includeSources == true)
         if not mirrorOk then
             setStatus("Mirror failed: " .. tostring(mirrorResult), false)
             busy = false
@@ -15146,6 +15156,7 @@ local function main()
 
         hasFullSnapshot = true
         lastFullSync = os.time()
+        lastMirroredRevision = liveRevision
         if includeSources then lastDeepSync = lastFullSync end
         local mirrored = type(mirrorResult) == "table" and tonumber(mirrorResult.instances) or nil
         local expected = type(mirrorResult) == "table" and tonumber(mirrorResult.expectedInstances) or nil
@@ -15155,35 +15166,13 @@ local function main()
         local sourceCoverage = type(mirrorResult) == "table" and tonumber(mirrorResult.sourceCoveragePercent) or nil
         local mirrorComplete = (not expected or not mirrored or expected == mirrored) and (not skipped or skipped == 0)
 
-        -- Freebuff reads the trusted disk workspace directly, so there is no reason to
-        -- build/send a second huge compact snapshot. Keep only current selection fresh.
-        if provider == "Freebuff" then
-            local selectionOk, selectionResult = Codex.SyncSelection()
-            contextLabel.Text = string.format(
-                "Freebuff mirror: %s/%s instances | sources %s/%s%s",
-                tostring(mirrored or "?"),
-                tostring(expected or mirrored or "?"),
-                tostring(mirroredScripts or 0),
-                tostring(scriptObjects or mirroredScripts or 0),
-                sourceCoverage and (" (" .. tostring(sourceCoverage) .. "%)") or ""
-            )
-            if not mirrorComplete then
-                setStatus("Mirror partial: " .. tostring(mirrored or "?") .. "/" .. tostring(expected or "?") .. " | skipped " .. tostring(skipped or 0), false)
-            elseif selectionOk then
-                setStatus(includeSources and "Deep Explorer mirror complete for Freebuff" or "Explorer mirror complete for Freebuff", true)
-            else
-                setStatus("Explorer mirror complete; selection sync warning: " .. tostring(selectionResult), nil)
-            end
-            busy = false
-            return true, mirrorResult
-        end
-
-        -- Codex embedded chat gets a SMALL best-effort snapshot. Full data remains on disk
-        -- under dex/, which Codex can read directly from its trusted workspace.
-        setStatus("Mirror ready; preparing compact Codex chat context...", nil)
-        local snapshot = Codex.BuildFullSnapshot(false)
+        -- Claude Code reads the trusted disk workspace. We still publish a compact
+        -- snapshot for compatibility/debugging, while the full mirror remains the
+        -- source of truth under dex/.
+        setStatus("Mirror ready; preparing compact Claude Code context...", nil)
+        local snapshot = ClaudeCode.BuildFullSnapshot(false)
         local contextOk, contextResult = syncPayload("full", snapshot)
-        local stats = Codex.LastSnapshotStats or {instances = 0, scripts = 0, truncated = false}
+        local stats = ClaudeCode.LastSnapshotStats or {instances = 0, scripts = 0, truncated = false}
 
         contextLabel.Text = string.format(
             "Explorer mirror: %s/%s instances | sources %s/%s | compact: %d%s",
@@ -15200,7 +15189,7 @@ local function main()
         elseif contextOk then
             setStatus(includeSources and "Deep Explorer mirror complete" or "Explorer mirror complete", true)
         else
-            -- Do NOT fail the sync. Codex can still read dex/tree.txt, instances.jsonl,
+            -- Do NOT fail the sync. Claude Code can still read dex/tree.txt, instances.jsonl,
             -- services/*.jsonl and scripts/*.luau from the trusted workspace.
             setStatus("Explorer mirror ready; compact chat context skipped", true)
         end
@@ -15455,57 +15444,26 @@ local function main()
         end)
     end
 
-    local function currentProvider()
-        return provider == "Freebuff" and "Freebuff" or "Codex"
-    end
-
     local function updateProviderVisuals()
-        if codexProviderButton then
-            codexProviderButton.BackgroundColor3 = provider == "Codex" and Settings.Theme.ListSelection or Settings.Theme.Button
-        end
-        if freebuffProviderButton then
-            freebuffProviderButton.BackgroundColor3 = provider == "Freebuff" and Settings.Theme.ListSelection or Settings.Theme.Button
+        if claudeProviderButton then
+            claudeProviderButton.Text = "Claude Code"
+            claudeProviderButton.BackgroundColor3 = Settings.Theme.ListSelection
+            claudeProviderButton.Active = false
+            claudeProviderButton.AutoButtonColor = false
         end
         if inputBox then
-            if provider == "Freebuff" then
-                inputBox.PlaceholderText = "Yêu cầu Freebuff...  Enter xuống dòng • Ctrl+Enter Stage"
-            else
-                inputBox.PlaceholderText = "Hỏi Codex...  Enter xuống dòng • Ctrl+Enter gửi"
-            end
+            inputBox.PlaceholderText = "Hỏi về game... Claude sẽ tự nghiên cứu Explorer • Ctrl+Enter gửi"
         end
-        if sendButton then
-            sendButton.Text = provider == "Freebuff" and "Stage" or "Send"
-        end
-        if newThreadButton then
-            newThreadButton.Text = provider == "Freebuff" and "Open Freebuff" or "New Chat"
-        end
-        if freebuffCheckButton then
-            freebuffCheckButton.Visible = provider == "Freebuff"
-        end
-        if window then
-            window:SetTitle("AI Assistant - " .. currentProvider())
-        end
+        if sendButton then sendButton.Text = "Send" end
+        if newThreadButton then newThreadButton.Text = "New Session" end
+        if window then window:SetTitle("AI Assistant - Claude Code | make by hongson") end
     end
 
-    function Codex.SetProvider(name)
-        provider = tostring(name) == "Freebuff" and "Freebuff" or "Codex"
-        Settings.Codex = Settings.Codex or {}
-        Settings.Codex.Provider = provider
-        updateProviderVisuals()
-        if provider == "Freebuff" then
-            setStatus("Checking Freebuff...", nil)
-            task.spawn(function() Codex.Health() end)
-        else
-            setStatus("Checking Codex...", nil)
-            task.spawn(function() Codex.Health() end)
-        end
-    end
-
-    function Codex.StageFreebuffPrompt(message)
+    function ClaudeCode.Ask(message)
         message = normalizePrompt(message)
         if message == "" then return end
         if busy then
-            addMessage("Freebuff", "A sync/request is already running.")
+            addMessage("Claude Code", "A request is already running.")
             return
         end
 
@@ -15517,91 +15475,68 @@ local function main()
 
         addMessage("You", message)
 
-        local ttl = tonumber(cfg("FullSnapshotTTL", 300)) or 300
-        local lowerMessage = string.lower(message)
-        local sourceWords = {"script", "module", "source", "luau", "lua", "code", "localscript", "modulescript", "mã nguồn", "đọc mã", "remote", "function"}
-        local needsSources = false
-        for i = 1, #sourceWords do
-            if string.find(lowerMessage, sourceWords[i], 1, true) then needsSources = true break end
-        end
+        -- Auto Research mode: the user should not need to manually select objects or press
+        -- Sync before asking a question. Every request receives a fresh hierarchy/property
+        -- mirror. Readable script sources are deep-synced on the first request, when the live
+        -- DataModel tree changed, or when the deep mirror ages out. Claude then researches
+        -- the mirror autonomously from disk using Grep/Read/Glob.
+        local now = os.time()
+        local treeChanged = liveRootsDirty == true
+        local autoResearch = cfg("AutoResearchExplorer", true) == true
+        local deepTtl = tonumber(cfg("DeepSnapshotTTL", 900)) or 900
+        local deepNeeded = false
 
-        -- Freebuff cannot call the live Dex protocol, so it needs a disk mirror. Keep
-        -- that mirror lazy too: metadata-only for normal Explorer questions, and only
-        -- decompile/export all readable sources when the request actually concerns code.
-        local mirrorStale = lastFullSync == 0 or (os.time() - lastFullSync) > ttl
-        local deepStale = lastDeepSync == 0 or (os.time() - lastDeepSync) > ttl
-        if mirrorStale or (needsSources and deepStale) then
-            setStatus(needsSources and "Freebuff: exporting Explorer + readable sources..." or "Freebuff: exporting Explorer metadata...", nil)
-            local mirrorOk, mirrorResult = Codex.SyncExplorerMirror(needsSources, false)
-            if mirrorOk then
-                hasFullSnapshot = true
-                lastFullSync = os.time()
-                if needsSources then lastDeepSync = lastFullSync end
-                local instances = type(mirrorResult) == "table" and mirrorResult.instances or "all"
-                local scripts = type(mirrorResult) == "table" and mirrorResult.scripts or 0
-                addMessage("Freebuff", needsSources
-                    and ("Source mirror ready: " .. tostring(instances) .. " instances, " .. tostring(scripts) .. " readable script sources.")
-                    or ("Explorer metadata mirror ready: " .. tostring(instances) .. " instances."))
-            else
-                addMessage("Freebuff", "Mirror refresh warning: " .. tostring(mirrorResult) .. ". I will still stage the request using the latest available mirror.")
+        if autoResearch then
+            deepNeeded = (cfg("AutoDeepSyncOnFirstPrompt", true) == true and lastDeepSync == 0)
+                or (cfg("AutoDeepSyncWhenTreeChanges", true) == true and treeChanged)
+                or (lastDeepSync > 0 and (now - lastDeepSync) > deepTtl)
+
+            if deepNeeded then
+                setStatus("Auto Research: indexing Explorer + properties + script sources...", nil)
+                local deepOk, deepResult = ClaudeCode.SyncExplorerMirror(true, true)
+                if deepOk then
+                    hasFullSnapshot = true
+                    lastFullSync = now
+                    lastDeepSync = now
+                    lastMirroredRevision = liveRevision
+                    local instances = type(deepResult) == "table" and deepResult.instances or "?"
+                    local scripts = type(deepResult) == "table" and deepResult.scripts or "?"
+                    contextLabel.Text = string.format("Auto Research ready | Explorer %s objects | %s readable sources", tostring(instances), tostring(scripts))
+                else
+                    addMessage("Claude Code", "Auto Research deep-sync warning: " .. tostring(deepResult))
+                end
+            elseif cfg("AutoRefreshExplorerEveryPrompt", true) == true then
+                setStatus("Auto Research: refreshing live Explorer + properties...", nil)
+                local mirrorOk, mirrorResult = ClaudeCode.SyncExplorerMirror(false, true)
+                if mirrorOk then
+                    hasFullSnapshot = true
+                    lastFullSync = now
+                    lastMirroredRevision = liveRevision
+                    local instances = type(mirrorResult) == "table" and mirrorResult.instances or "?"
+                    contextLabel.Text = string.format("Auto Research refreshed | Explorer %s objects | source mirror cached", tostring(instances))
+                else
+                    addMessage("Claude Code", "Auto Research Explorer warning: " .. tostring(mirrorResult))
+                end
+            end
+        elseif cfg("AutoMirrorBeforeClaudeChat", true) == true then
+            local ttl = tonumber(cfg("FullSnapshotTTL", 300)) or 300
+            if lastFullSync == 0 or (now - lastFullSync) > ttl then
+                setStatus("Refreshing Dex Explorer mirror...", nil)
+                local mirrorOk, mirrorResult = ClaudeCode.SyncExplorerMirror(false, true)
+                if mirrorOk then
+                    hasFullSnapshot = true
+                    lastFullSync = now
+                    lastMirroredRevision = liveRevision
+                else
+                    addMessage("Claude Code", "Explorer mirror warning: " .. tostring(mirrorResult))
+                end
             end
         end
 
-        setStatus("Syncing selection for Freebuff...", nil)
-        local selection = Codex.BuildSelectionContext(true, false)
-        local syncOk, syncErr = syncPayload("selection", selection)
-        if not syncOk then
-            addMessage("Freebuff", "Selection sync warning: " .. tostring(syncErr) .. ". The full disk mirror remains usable if Deep Sync succeeded.")
-        end
-
-        local ok, result = requestBridge("/freebuff/prompt", "POST", {
-            message = message,
-            placeId = game.PlaceId,
-            jobId = game.JobId,
-            selectedCount = selection.selectedCount,
-        })
-
-        if ok then
-            local promptFile = type(result) == "table" and tostring(result.file or "FREEBUFF_REQUEST.md") or "FREEBUFF_REQUEST.md"
-            addMessage("Freebuff", "Request staged in " .. promptFile .. ". Freebuff uses the same trusted Dex mirror. Press Open Freebuff, then ask it to read FREEBUFF_REQUEST.md (DEX_SKILL.md explains the mirror only if Freebuff needs it).")
-            setStatus("Freebuff request staged", true)
-        else
-            addMessage("Freebuff", "Could not stage request: " .. tostring(result))
-            setStatus("Freebuff staging failed", false)
-        end
-
-        busy = false
-        if sendButton then
-            sendButton.Text = "Stage"
-            sendButton.Active = true
-        end
-    end
-
-    function Codex.Ask(message)
-        message = normalizePrompt(message)
-        if message == "" then return end
-        if provider == "Freebuff" then
-            return Codex.StageFreebuffPrompt(message)
-        end
-        if busy then
-            addMessage("Codex", "A request is already running.")
-            return
-        end
-
-        busy = true
-        if sendButton then
-            sendButton.Text = "..."
-            sendButton.Active = false
-        end
-
-        addMessage("You", message)
-
-        -- Lazy Read mode: never full/deep-sync the 60k+ Explorer just because a
-        -- chat message was sent. Only a tiny current-selection hint is attached. Codex
-        -- requests exactly the live Dex data it needs through DEX_QUERY/DEX_QUERIES.
-        -- Full Sync / Deep Sync remain explicit buttons for disk-mirror/Freebuff use.
-        setStatus("Preparing live Dex context...", nil)
-        local selection = Codex.BuildSelectionContext(false, false)
+        -- Selection is only a hint. Claude is explicitly instructed to research the whole
+        -- accessible Explorer when needed and must not treat the current selection as scope.
+        setStatus("Syncing optional selection hint...", nil)
+        local selection = ClaudeCode.BuildSelectionContext(false, false)
         local selectionHint = {}
         for i = 1, math.min(selection.selectedCount or 0, 8) do
             local item = selection.selected[i]
@@ -15614,61 +15549,36 @@ local function main()
             }
         end
 
-        setStatus("Codex: reading only what this request needs...", nil)
+        local syncOk, syncErr = syncPayload("selection", selection)
+        if not syncOk then
+            addMessage("Claude Code", "Selection hint warning: " .. tostring(syncErr))
+        end
+
+        setStatus("Claude is researching Roblox Explorer...", nil)
         local ok, result = requestBridge("/chat", "POST", {
             message = message,
             placeId = game.PlaceId,
             jobId = game.JobId,
+            autoResearch = autoResearch,
+            explorerRevision = liveRevision,
+            treeChanged = treeChanged,
+            deepSynced = deepNeeded,
             selectedCount = selection.selectedCount,
             selectionHint = selectionHint,
         })
 
         if ok then
-            local maxHops = tonumber(cfg("MaxToolHops", 8)) or 8
-            local hops = 0
-            while type(result) == "table" and (result.dexQuery or result.dexQueries) and hops < maxHops do
-                hops += 1
-                local queries = type(result.dexQueries) == "table" and result.dexQueries or {result.dexQuery}
-                local names = {}
-                for i = 1, math.min(#queries, tonumber(cfg("MaxToolBatch", 8)) or 8) do
-                    local q = queries[i]
-                    names[#names + 1] = type(q) == "table" and tostring(q.op or q.operation or "read") or "read"
-                end
-                setStatus("Codex reading Dex: " .. table.concat(names, ", ") .. "...", nil)
-                local toolResults = Codex.ExecuteQueries(queries)
-                local nextOk, nextResult = requestBridge("/chat", "POST", {
-                    toolResults = toolResults,
-                    toolQueries = queries,
-                    continuation = true,
-                    placeId = game.PlaceId,
-                    jobId = game.JobId,
-                })
-                if not nextOk then
-                    ok = false
-                    result = nextResult
-                    break
-                end
-                result = nextResult
+            local answer = type(result) == "table" and (result.answer or result.text or result.response) or tostring(result)
+            addMessage("Claude Code", answer or "(empty response)")
+            if type(result) == "table" and type(result.choices) == "table" then
+                addChoiceButtons(result.choices)
             end
-
-            if ok then
-                if type(result) == "table" and (result.dexQuery or result.dexQueries) then
-                    addMessage("Codex", "Dex query limit reached before Codex produced a final answer.")
-                    setStatus("Tool-hop limit reached", false)
-                else
-                    local answer = type(result) == "table" and (result.answer or result.text or result.response) or tostring(result)
-                    addMessage("Codex", answer or "(empty response)")
-                    if type(result) == "table" and type(result.choices) == "table" then
-                        addChoiceButtons(result.choices)
-                    end
-                    setStatus("Ready", true)
-                end
-            else
-                addMessage("Codex", "Bridge/Codex error: " .. tostring(result))
-                setStatus("Request failed", false)
+            if type(result) == "table" and result.workspace then
+                contextLabel.Text = "Auto Research | Claude workspace: " .. sanitizeString(result.workspace, 180)
             end
+            setStatus("Ready / Explorer research complete", true)
         else
-            addMessage("Codex", "Bridge/Codex error: " .. tostring(result))
+            addMessage("Claude Code", "Bridge/Claude Code error: " .. tostring(result))
             setStatus("Request failed", false)
         end
 
@@ -15679,35 +15589,123 @@ local function main()
         end
     end
 
-    function Codex.Health()
-        if provider == "Freebuff" then
-            local ok, result = requestBridge("/freebuff/status", "GET")
-            if ok then
-                local installed = type(result) == "table" and result.installed
-                local launched = type(result) == "table" and result.launched
-                local mirrorReady = type(result) == "table" and result.mirrorReady
-                if installed then
-                    if launched then
-                        setStatus(mirrorReady and "Bridge ✓ | Freebuff opened | choose model in terminal" or "Bridge ✓ | Freebuff opened | mirror not synced", mirrorReady and true or nil)
-                    else
-                        setStatus(mirrorReady and "Bridge ✓ | Freebuff ready | mirror synced" or "Bridge ✓ | Freebuff ready | press Deep Sync", true)
-                    end
-                else
-                    setStatus("Bridge ✓ | Freebuff command not found", false)
-                end
-            else
-                setStatus("Bridge offline: " .. tostring(result), false)
-            end
-            return ok, result
+    function ClaudeCode.StartupResearch()
+        if startupResearchDone then return true, "already researched" end
+        if busy or startupResearchRunning then return false, "busy" end
+
+        startupResearchRunning = true
+        busy = true
+        if sendButton then
+            sendButton.Text = "..."
+            sendButton.Active = false
         end
 
+        setStatus("Startup Research: reading complete Roblox Explorer...", nil)
+        local deepOk, deepResult = ClaudeCode.SyncExplorerMirror(true, true)
+        if not deepOk then
+            addMessage("Claude Code", "Startup Explorer research could not mirror the game: " .. tostring(deepResult))
+            setStatus("Startup Explorer mirror failed", false)
+            busy = false
+            startupResearchRunning = false
+            if sendButton then sendButton.Text = "Send" sendButton.Active = true end
+            return false, deepResult
+        end
+
+        local now = os.time()
+        hasFullSnapshot = true
+        lastFullSync = now
+        lastDeepSync = now
+        lastMirroredRevision = liveRevision
+        startupResearchDone = true
+
+        local instances = type(deepResult) == "table" and tonumber(deepResult.instances) or 0
+        local scripts = type(deepResult) == "table" and tonumber(deepResult.scripts) or 0
+        local scriptObjects = type(deepResult) == "table" and tonumber(deepResult.scriptObjects) or 0
+        contextLabel.Text = string.format(
+            "Explorer indexed: %d objects | readable sources %d/%d | Claude studying...",
+            instances or 0,
+            scripts or 0,
+            scriptObjects or 0
+        )
+
+        local selection = ClaudeCode.BuildSelectionContext(false, false)
+        syncPayload("selection", selection)
+
+        setStatus("Startup Research: Claude is building a Roblox architecture map...", nil)
+        local ok, result = requestBridge("/research", "POST", {
+            reason = "startup",
+            placeId = game.PlaceId,
+            jobId = game.JobId,
+            explorerRevision = liveRevision,
+            instances = instances,
+            scripts = scripts,
+            scriptObjects = scriptObjects,
+        })
+
+        if ok then
+            local answer = type(result) == "table" and (result.answer or result.summary or result.text) or tostring(result)
+            if answer and answer ~= "" then
+                addMessage("Claude Code", answer)
+            else
+                addMessage("Claude Code", "Startup Research complete. Claude has indexed and studied the accessible Roblox Explorer.")
+            end
+            local report = type(result) == "table" and result.report or nil
+            contextLabel.Text = report and ("Research ready: " .. sanitizeString(report, 160)) or "Research ready | full Explorer context indexed"
+            setStatus("Claude finished studying the Roblox Explorer", true)
+        else
+            addMessage("Claude Code", "Explorer mirror is ready, but the autonomous research pass failed: " .. tostring(result))
+            setStatus("Explorer indexed; Claude research pass failed", false)
+        end
+
+        busy = false
+        startupResearchRunning = false
+        if sendButton then
+            sendButton.Text = "Send"
+            sendButton.Active = true
+        end
+        return ok, result
+    end
+
+    local function RefreshChangedExplorerInBackground()
+        if busy or startupResearchRunning or not startupResearchDone then return false, "busy" end
+        if cfg("AutoMirrorExplorerChanges", true) ~= true then return false, "disabled" end
+        if liveRevision == lastMirroredRevision then return true, "unchanged" end
+
+        busy = true
+        setStatus("Explorer changed; updating Claude index...", nil)
+        local ok, result = ClaudeCode.SyncExplorerMirror(false, true)
+        if ok then
+            hasFullSnapshot = true
+            lastFullSync = os.time()
+            lastMirroredRevision = liveRevision
+            local instances = type(result) == "table" and result.instances or "?"
+            contextLabel.Text = string.format("Explorer auto-updated: %s objects | source research cache retained", tostring(instances))
+            setStatus("Claude Explorer index refreshed", true)
+        else
+            setStatus("Explorer auto-refresh failed", false)
+        end
+        busy = false
+        return ok, result
+    end
+
+    function ClaudeCode.Health()
         local ok, result = requestBridge("/health", "GET")
         if ok then
             local ready = type(result) == "table" and result.ready
+            local workspace = type(result) == "table" and result.workspace or nil
+            local projectRoot = type(result) == "table" and result.projectRoot or nil
+            local roots = type(result) == "table" and result.roots or nil
+            local endpoint = type(result) == "table" and result.endpoint or nil
             if ready == false then
-                setStatus("Bridge online; Codex not ready", false)
+                setStatus("Bridge online; Claude Code CLI not found", false)
             else
-                setStatus("Bridge online / Codex ready", true)
+                setStatus("Bridge online / Claude Code ready", true)
+            end
+            if contextLabel and workspace then
+                local endpointText = endpoint and endpoint ~= "default" and (" | endpoint: " .. tostring(endpoint)) or ""
+                local rootCount = type(roots) == "table" and #roots or 1
+                local projectText = projectRoot and sanitizeString(projectRoot, 110) or sanitizeString(workspace, 110)
+                contextLabel.Text = "Project: " .. projectText .. " | roots: " .. tostring(rootCount) .. endpointText
             end
         else
             setStatus("Bridge offline: " .. tostring(result), false)
@@ -15715,66 +15713,37 @@ local function main()
         return ok, result
     end
 
-    function Codex.CheckFreebuffResponse(silent)
-        local ok, result = requestBridge("/freebuff/response", "GET")
-        if not ok then
-            if not silent then
-                addMessage("Freebuff", "Cannot check response: " .. tostring(result))
-                setStatus("Freebuff response check failed", false)
-            end
-            return false, result
-        end
-        if type(result) ~= "table" or result.available ~= true then
-            if not silent then
-                addMessage("Freebuff", "No FREEBUFF_RESPONSE.json yet. In the Freebuff terminal, choose a model and ask it to read FREEBUFF_REQUEST.md; the request tells it to write the answer back for Dex.")
-                setStatus("Waiting for Freebuff answer", nil)
-            end
-            return true, result
-        end
-        local responseId = tostring(result.responseId or result.requestId or result.updatedAt or "response")
-        if responseId ~= lastFreebuffResponseId then
-            lastFreebuffResponseId = responseId
-            addMessage("Freebuff", tostring(result.answer or "(empty Freebuff response)"))
-            if type(result.choices) == "table" then addChoiceButtons(result.choices) end
-            if type(result.actions) == "table" and #result.actions > 0 then
-                local safeActions = {}
-                for i = 1, math.min(#result.actions, 4) do
-                    local action = result.actions[i]
-                    local op = type(action) == "table" and tostring(action.op or action.operation or "") or ""
-                    if op == "select_instance" or op == "view_instance" or op == "open_script" then
-                        safeActions[#safeActions + 1] = action
-                    end
-                end
-                if #safeActions > 0 then
-                    local actionResults = Codex.ExecuteQueries(safeActions)
-                    addMessage("AI", "Applied " .. tostring(#safeActions) .. " safe Dex UI action(s) from Freebuff.")
-                end
-            end
-        end
-        setStatus("Freebuff answer received", true)
-        return true, result
-    end
-
-    function Codex.NewThread()
-        if provider == "Freebuff" then
-            local ok, result = requestBridge("/freebuff/open", "POST", {})
-            if ok then
-                addMessage("Freebuff", "Opened Freebuff in the trusted Dex mirror workspace. It can read dex/tree.txt, dex/instances.jsonl, dex/services/* and dex/scripts/* from the latest Sync/Deep Sync.")
-                setStatus("Freebuff opened — choose a model in the terminal", true)
-            else
-                addMessage("Freebuff", "Could not open Freebuff: " .. tostring(result))
-                setStatus("Freebuff launch failed", false)
-            end
-            return ok, result
-        end
-
+    function ClaudeCode.NewThread()
         local ok, result = requestBridge("/new-thread", "POST", {})
         if ok then
-            addMessage("Codex", "Started a new Codex thread. Dex context is preserved on the bridge.")
-            setStatus("New thread ready", true)
+            addMessage("Claude Code", "Started a new Claude Code session. The local Dex workspace is preserved.")
+            setStatus("New Claude session ready", true)
         else
-            addMessage("Codex", "Could not start a new thread: " .. tostring(result))
-            setStatus("New thread failed", false)
+            addMessage("Claude Code", "Could not start a new session: " .. tostring(result))
+            setStatus("New session failed", false)
+        end
+        return ok, result
+    end
+
+    function ClaudeCode.OpenClaude()
+        local ok, result = requestBridge("/open", "POST", {})
+        if ok then
+            addMessage("Claude Code", "Opened Claude Code at the configured project root with all configured context roots.")
+            setStatus("Claude Code terminal opened", true)
+        else
+            addMessage("Claude Code", "Could not open Claude Code: " .. tostring(result))
+            setStatus("Open Claude Code failed", false)
+        end
+        return ok, result
+    end
+
+    function ClaudeCode.OpenWorkspace()
+        local ok, result = requestBridge("/workspace/open", "POST", {})
+        if ok then
+            setStatus("Workspace opened", true)
+        else
+            addMessage("Claude Code", "Could not open workspace: " .. tostring(result))
+            setStatus("Open workspace failed", false)
         end
         return ok, result
     end
@@ -15796,9 +15765,7 @@ local function main()
         corner.Parent = button
         button.MouseEnter:Connect(function() button.BackgroundColor3 = Settings.Theme.ButtonHover end)
         button.MouseLeave:Connect(function()
-            if button == codexProviderButton and provider == "Codex" then
-                button.BackgroundColor3 = Settings.Theme.ListSelection
-            elseif button == freebuffProviderButton and provider == "Freebuff" then
+            if button == claudeProviderButton then
                 button.BackgroundColor3 = Settings.Theme.ListSelection
             else
                 button.BackgroundColor3 = Settings.Theme.Button
@@ -15807,11 +15774,11 @@ local function main()
         return button
     end
 
-    Codex.Init = function()
+    ClaudeCode.Init = function()
         window = Lib.Window.new()
         window:SetTitle("AI Assistant")
         window:Resize(640, 520)
-        Codex.Window = window
+        ClaudeCode.Window = window
 
         local content = window.GuiElems.Content
 
@@ -15824,14 +15791,15 @@ local function main()
         local topCorner = Instance.new("UICorner", top)
         topCorner.CornerRadius = UDim.new(0, 4)
 
-        codexProviderButton = makeButton(top, "Codex", 4, 70, 3, 22)
-        freebuffProviderButton = makeButton(top, "Freebuff", 78, 78, 3, 22)
+        claudeProviderButton = makeButton(top, "Claude Code", 4, 104, 3, 22)
+        claudeProviderButton.BackgroundColor3 = Settings.Theme.ListSelection
+        claudeProviderButton.Active = false
 
-        syncButton = makeButton(top, "Sync Dex", 4, 76, 30, 22)
-        deepSyncButton = makeButton(top, "Deep Sync", 84, 84, 30, 22)
-        newThreadButton = makeButton(top, "New Chat", 172, 92, 30, 22)
-        freebuffCheckButton = makeButton(top, "Check Answer", 268, 96, 30, 22)
-        freebuffCheckButton.Visible = false
+        syncButton = makeButton(top, "Refresh", 4, 76, 30, 22)
+        deepSyncButton = makeButton(top, "Reindex All", 84, 84, 30, 22)
+        newThreadButton = makeButton(top, "New Session", 172, 90, 30, 22)
+        openClaudeButton = makeButton(top, "Open Claude", 266, 94, 30, 22)
+        openWorkspaceButton = makeButton(top, "Open Folder", 364, 88, 30, 22)
 
         statusLabel = Instance.new("TextLabel")
         statusLabel.BackgroundTransparency = 1
@@ -15840,8 +15808,8 @@ local function main()
         statusLabel.TextXAlignment = Enum.TextXAlignment.Right
         statusLabel.TextColor3 = Settings.Theme.Text
         statusLabel.Text = "Checking bridge..."
-        statusLabel.Position = UDim2.new(0, 164, 0, 3)
-        statusLabel.Size = UDim2.new(1, -170, 0, 22)
+        statusLabel.Position = UDim2.new(0, 116, 0, 3)
+        statusLabel.Size = UDim2.new(1, -122, 0, 22)
         statusLabel.Parent = top
 
         contextLabel = Instance.new("TextLabel")
@@ -15850,7 +15818,7 @@ local function main()
         contextLabel.TextSize = 12
         contextLabel.TextXAlignment = Enum.TextXAlignment.Left
         contextLabel.TextColor3 = Settings.Theme.PlaceholderText
-        contextLabel.Text = "Lazy Read ON | Sync/Deep Sync are manual exports; chat reads live Dex on demand"
+        contextLabel.Text = "Auto Research | Claude reads Roblox Explorer + properties + scripts automatically"
         contextLabel.Position = UDim2.new(0, 8, 0, 67)
         contextLabel.Size = UDim2.new(1, -16, 0, 18)
         contextLabel.Parent = content
@@ -15893,7 +15861,7 @@ local function main()
         inputBox.TextSize = 13
         inputBox.TextColor3 = Settings.Theme.Text
         inputBox.PlaceholderColor3 = Settings.Theme.PlaceholderText
-        inputBox.PlaceholderText = "Nhập yêu cầu...  Enter xuống dòng • Ctrl+Enter gửi"
+        inputBox.PlaceholderText = "Hỏi về game... Claude sẽ tự nghiên cứu Explorer • Ctrl+Enter gửi"
         inputBox.TextXAlignment = Enum.TextXAlignment.Left
         inputBox.TextYAlignment = Enum.TextYAlignment.Top
         inputBox.TextWrapped = true
@@ -15944,17 +15912,7 @@ local function main()
         inputBox:GetPropertyChangedSignal("AbsoluteSize"):Connect(updateComposerSize)
         task.defer(updateComposerSize)
 
-        codexProviderButton.MouseButton1Click:Connect(function()
-            if busy then return end
-            Codex.SetProvider("Codex")
-            contextLabel.Text = "Codex: Lazy Read ON | reads Explorer/properties/source only when your request needs them"
-        end)
-
-        freebuffProviderButton.MouseButton1Click:Connect(function()
-            if busy then return end
-            Codex.SetProvider("Freebuff")
-            contextLabel.Text = "Freebuff: trusted-folder mode | Sync/Deep Sync mirrors ALL Explorer; Open Freebuff launches it in that folder"
-        end)
+        -- Claude Code is the only provider in this edition.
 
         local function submit(explicitText)
             local message = normalizePrompt(explicitText ~= nil and explicitText or inputBox.Text)
@@ -15969,14 +15927,14 @@ local function main()
                     inputBox:CaptureFocus()
                 end
             end)
-            task.spawn(function() Codex.Ask(message) end)
+            task.spawn(function() ClaudeCode.Ask(message) end)
         end
 
         sendButton.MouseButton1Click:Connect(function() submit() end)
 
         -- Editor-style composer:
         --   Enter       -> normal newline (handled natively by the MultiLine TextBox)
-        --   Ctrl+Enter  -> send/stage without destroying multiline formatting
+        --   Ctrl+Enter  -> send without destroying multiline formatting
         service.UserInputService.InputBegan:Connect(function(input, processed)
             if not inputBox or not inputBox:IsFocused() then return end
             if input.KeyCode ~= Enum.KeyCode.Return then return end
@@ -16000,50 +15958,74 @@ local function main()
 
         syncButton.MouseButton1Click:Connect(function()
             if busy then return end
-            task.spawn(function() Codex.SyncFull(false) end)
+            task.spawn(function() ClaudeCode.SyncFull(false) end)
         end)
 
         deepSyncButton.MouseButton1Click:Connect(function()
             if busy then return end
-            task.spawn(function() Codex.SyncFull(true) end)
+            task.spawn(function() ClaudeCode.SyncFull(true) end)
         end)
 
         newThreadButton.MouseButton1Click:Connect(function()
             if busy then return end
-            task.spawn(Codex.NewThread)
+            task.spawn(ClaudeCode.NewThread)
         end)
 
-        freebuffCheckButton.MouseButton1Click:Connect(function()
-            if busy or provider ~= "Freebuff" then return end
-            task.spawn(function() Codex.CheckFreebuffResponse(false) end)
+        openClaudeButton.MouseButton1Click:Connect(function()
+            if busy then return end
+            task.spawn(ClaudeCode.OpenClaude)
+        end)
+
+        openWorkspaceButton.MouseButton1Click:Connect(function()
+            if busy then return end
+            task.spawn(ClaudeCode.OpenWorkspace)
         end)
 
         if Explorer and Explorer.Selection and Explorer.Selection.Changed then
             Explorer.Selection.Changed:Connect(function()
                 local count = #Explorer.Selection.List
-                contextLabel.Text = string.format("Selection changed: %d object(s) | auto-syncs when you send", count)
+                contextLabel.Text = string.format("Auto Research enabled | selection %d object(s) is only an optional hint", count)
             end)
         end
 
-        addMessage("AI", "Dex++ AI Assistant v1.6.2 ready. Lazy Read is ON: Codex does not scan/decompile the full Explorer before every message. It requests only the objects, properties and scripts needed for your current request. Use Sync/Deep Sync only when you explicitly want a disk mirror or Freebuff workspace. Enter creates a new line; Ctrl+Enter sends.")
+        addMessage("AI", "Dex++ Claude Code v5 Startup Research - make by hongson. You do not need to press Sync or ask Claude to read Explorer first. When the local bridge becomes ready, Dex++ automatically Deep Mirrors the accessible Roblox DataModel, readable properties and script sources, then Claude autonomously studies the game architecture. Selection is only an optional hint. Ctrl+Enter sends.")
         updateProviderVisuals()
-        task.spawn(Codex.Health)
-        -- Keep status live. This fixes the confusing case where Freebuff is launched
-        -- after Dex initially reported the bridge as offline.
+
+        task.spawn(function()
+            while window and window.GuiElems and window.GuiElems.Main and window.GuiElems.Main.Parent and not startupResearchDone do
+                if not busy and cfg("AutoResearchOnStartup", true) == true then
+                    local healthOk, health = ClaudeCode.Health()
+                    if healthOk and type(health) == "table" and health.ready ~= false then
+                        task.wait(math.max(0, tonumber(cfg("StartupResearchDelay", 1.5)) or 1.5))
+                        if not busy and not startupResearchDone then
+                            ClaudeCode.StartupResearch()
+                        end
+                        break
+                    end
+                end
+                task.wait(3)
+            end
+        end)
+
+        task.spawn(function()
+            local interval = math.max(5, tonumber(cfg("AutoMirrorExplorerInterval", 20)) or 20)
+            while window and window.GuiElems and window.GuiElems.Main and window.GuiElems.Main.Parent do
+                task.wait(interval)
+                if startupResearchDone and not busy and liveRevision ~= lastMirroredRevision then
+                    RefreshChangedExplorerInBackground()
+                end
+            end
+        end)
+
         task.spawn(function()
             while window and window.GuiElems and window.GuiElems.Main and window.GuiElems.Main.Parent do
                 task.wait(3)
-                if not busy then
-                    Codex.Health()
-                    if provider == "Freebuff" then
-                        Codex.CheckFreebuffResponse(true)
-                    end
-                end
+                if not busy then ClaudeCode.Health() end
             end
         end)
     end
 
-    return Codex
+    return ClaudeCode
 end
 
 return {InitDeps = initDeps, InitAfterMain = initAfterMain, Main = main}
@@ -16087,7 +16069,7 @@ end
 local isFsSupported = readfile and writefile and isfile and isfolder and listfiles and delfile and delfolder
 
 -- Main vars
-local Main, Explorer, Properties, ScriptViewer, Console, SaveInstance, ModelViewer, SettingsWindow, Codex--[[, SecretServicePanel]], DefaultSettings, Notebook, Serializer, Lib local ggv = getgenv or nil
+local Main, Explorer, Properties, ScriptViewer, Console, SaveInstance, ModelViewer, SettingsWindow, ClaudeCode--[[, SecretServicePanel]], DefaultSettings, Notebook, Serializer, Lib local ggv = getgenv or nil
 local API, RMD
 
 -- Default Settings
@@ -16166,12 +16148,9 @@ DefaultSettings = (function()
 		ScriptViewer = {
 			ShowMoreInfo = true;
 		},
-		Codex = {
+		ClaudeCode = {
 			_Recurse = true,
-			Provider = "Codex",
 			BridgeUrl = "http://127.0.0.1:32187",
-			MaxInstances = 12000, -- legacy compact cap; disk mirror itself is uncapped
-			MaxScripts = 250,
 			CompactContextMaxInstances = 2500,
 			CompactContextMaxScripts = 0, -- sources live in dex/scripts/*.luau after Deep Sync
 			MaxPropertiesPerInstance = 160,
@@ -16185,17 +16164,23 @@ DefaultSettings = (function()
 			ComposerMaxHeight = 220,
 			ComposerMeasureCharLimit = 12000, -- avoid measuring huge pasted prompts every keystroke
 			FullSnapshotTTL = 300,
-			MaxToolHops = 14,
 			MaxToolBatch = 8,
 			MaxToolPageSize = 500,
 			ToolSourceChunkBytes = 32000,
-			AutoMirrorBeforeCodexChat = false, -- V6 Lazy Read
-			AutoDeepSyncCodexForScriptQueries = false, -- source is requested only when needed
-			AutoDeepSyncFreebuff = true,
+			AutoResearchOnStartup = true, -- Deep Mirror + autonomous Claude study before the first user prompt
+			StartupResearchDelay = 1.5,
+			AutoMirrorExplorerChanges = true, -- refresh hierarchy/properties after live Explorer changes
+			AutoMirrorExplorerInterval = 20,
+			AutoResearchExplorer = true, -- every prompt continues researching the Roblox Explorer automatically
+			AutoRefreshExplorerEveryPrompt = true, -- refresh hierarchy + readable properties before every Claude request
+			AutoDeepSyncOnFirstPrompt = true, -- first request exports all readable script sources automatically
+			AutoDeepSyncWhenTreeChanges = true, -- refresh sources when objects/scripts are added or removed
+			DeepSnapshotTTL = 900, -- periodically refresh cached readable sources even if the tree is unchanged
+			AutoMirrorBeforeClaudeChat = true, -- legacy fallback when AutoResearchExplorer is disabled
 			MirrorChunkSize = 40,
 			MirrorSourceChunkBytes = 48000,
 			MirrorPropertiesPerInstance = 0, -- 0 = every readable API property; large strings can be paged live with get_property
-			MirrorIncludeNilInstances = false,
+			MirrorIncludeNilInstances = true, -- include nil instances when the environment exposes them
 		},
 		Window = {
 			TitleOnMiddle = false,
@@ -16257,7 +16242,7 @@ end
 Main = (function()
 	local Main = {}
 
-	Main.ModuleList = {"Explorer","Properties","ScriptViewer","Console","SaveInstance","ModelViewer","SettingsWindow","Codex"}
+	Main.ModuleList = {"Explorer","Properties","ScriptViewer","Console","SaveInstance","ModelViewer","SettingsWindow","ClaudeCode"}
 	Main.Elevated = false
 	Main.AllowDraggableOnMobile = true
 	Main.MissingEnv = {}
@@ -16514,7 +16499,7 @@ Main = (function()
 		ModelViewer = Apps.ModelViewer
 		Notebook = Apps.Notebook
 		SettingsWindow = Apps.SettingsWindow
-		Codex = Apps.Codex
+		ClaudeCode = Apps.ClaudeCode
 		
 		
 		--SecretServicePanel = Apps.SecretServicePanel
@@ -16527,7 +16512,7 @@ Main = (function()
 			ModelViewer = ModelViewer,
 			Notebook = Notebook,
 			SettingsWindow = SettingsWindow,
-			Codex = Codex
+			ClaudeCode = ClaudeCode
 			--SecretServicePanel = SecretServicePanel,
 		}
 		
@@ -17183,7 +17168,7 @@ Main = (function()
 			{8,"Frame",{BackgroundColor3=Color3.new(0.20392157137394,0.20392157137394,0.20392157137394),BorderSizePixel=0,Name="ProgressBar",Parent={3},Position=UDim2.new(0,110,0,145),Size=UDim2.new(0,0,0,4),}},
 			{9,"Frame",{BackgroundColor3=Color3.new(0.2392156869173,0.56078433990479,0.86274510622025),BorderSizePixel=0,Name="Bar",Parent={8},Size=UDim2.new(0,0,1,0),}},
 			{10,"ImageLabel",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,Image="rbxassetid://2764171053",ImageColor3=Color3.new(0.17647059261799,0.17647059261799,0.17647059261799),Parent={8},ScaleType=1,Size=UDim2.new(1,0,1,0),SliceCenter=Rect.new(2,2,254,254),}},
-			{11,"TextLabel",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,Font=3,Name="Creator",Parent={2},Position=UDim2.new(1,-110,1,-20),Size=UDim2.new(0,105,0,20),Text="Developed by Chillz.",TextColor3=Color3.new(1,1,1),TextSize=14,TextXAlignment=1,}},
+			{11,"TextLabel",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,Font=3,Name="Creator",Parent={2},Position=UDim2.new(1,-110,1,-20),Size=UDim2.new(0,105,0,20),Text="Make by hongson.",TextColor3=Color3.new(1,1,1),TextSize=14,TextXAlignment=1,}},
 			{12,"UIGradient",{Parent={11},Transparency=NumberSequence.new({NumberSequenceKeypoint.new(0,1,0),NumberSequenceKeypoint.new(1,1,0),}),}},
 			{13,"TextLabel",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,Font=3,Name="Version",Parent={2},Position=UDim2.new(1,-110,1,-35),Size=UDim2.new(0,105,0,20),Text=Main.Version,TextColor3=Color3.new(1,1,1),TextSize=14,TextXAlignment=1,}},
 			{14,"UIGradient",{Parent={13},Transparency=NumberSequence.new({NumberSequenceKeypoint.new(0,1,0),NumberSequenceKeypoint.new(1,1,0),}),}},
@@ -17564,7 +17549,7 @@ Main = (function()
 		
 		Main.CreateApp({Name = "Console", IconMap = Main.LargeIcons, Icon = "Executor", Window = Console.Window})
 
-		Main.CreateApp({Name = "AI Assistant", IconMap = Main.LargeIcons, Icon = "Script_Viewer", Window = Codex.Window})
+		Main.CreateApp({Name = "AI Assistant", IconMap = Main.LargeIcons, Icon = "Script_Viewer", Window = ClaudeCode.Window})
 		
 		Main.CreateApp({Name = "Save Instance", IconMap = Main.LargeIcons, Icon = "Book", Window = SaveInstance.Window})
 		
@@ -17699,7 +17684,7 @@ Main = (function()
 		SaveInstance.Init()
 		ModelViewer.Init()
 		SettingsWindow.Init()
-		Codex.Init()
+		ClaudeCode.Init()
 		--SecretServicePanel.Init()
 		
 		
