@@ -14088,7 +14088,7 @@ end
 end,
 ["Exporter"] = function()
 --[[
-    Dex++ DexBridge Exporter v7 - make by hongson
+    Dex++ DexBridge Exporter v8 - make by hongson
 
     One-click client-visible Explorer export through a localhost bridge.
     The bridge writes a detailed Explorer snapshot directly beside DexBridge,
@@ -14139,8 +14139,9 @@ local function main()
     local busy = false
     local sourceCache = setmetatable({}, {__mode = "k"})
     local pathCache = setmetatable({}, {__mode = "k"})
+    local guiCache = setmetatable({}, {__mode = "k"})
 
-    Exporter.Version = "7.0.0-hongson"
+    Exporter.Version = "8.0.0-hongson"
     Exporter.Window = nil
     Exporter.LastResult = nil
 
@@ -14204,7 +14205,10 @@ local function main()
         value = sanitizeUtf8(value)
         maxLen = tonumber(maxLen) or 32768
         if #value > maxLen then
-            return value:sub(1, maxLen) .. "\n...[truncated " .. tostring(#value - maxLen) .. " chars]"
+            -- A byte-based cut can split a multibyte UTF-8 sequence. Re-sanitize the
+            -- truncated value so HttpService:JSONEncode never receives broken UTF-8.
+            value = sanitizeUtf8(value:sub(1, maxLen))
+            return value .. "\n...[truncated]"
         end
         return value
     end
@@ -14268,7 +14272,8 @@ local function main()
                     out["<truncated>"] = true
                     break
                 end
-                out[tostring(k)] = serializeValue(v, depth + 1, seen)
+                local safeKey = sanitizeString(tostring(k), 512)
+                out[safeKey] = serializeValue(v, depth + 1, seen)
             end
             seen[value] = nil
             return out
@@ -14280,6 +14285,35 @@ local function main()
         local ok, result = pcall(HttpService.JSONEncode, HttpService, value)
         if ok then return result end
         return nil, tostring(result)
+    end
+
+    -- Last-resort normalizer used only after a JSON encoding failure. Normal exports
+    -- stay on the fast path; one unusual Roblox/executor value cannot abort the dump.
+    local function forceJsonSafe(value, depth, seen)
+        depth = depth or 0
+        if depth > 8 then return "<max-depth>" end
+        local t = typeof(value)
+        if t == "nil" or t == "boolean" then return value end
+        if t == "number" then return safeNumber(value) end
+        if t == "string" then return sanitizeString(value, cfg("MaxStringLength", 32768)) end
+        if t ~= "table" then return serializeValue(value, depth, seen) end
+
+        seen = seen or {}
+        if seen[value] then return "<cycle>" end
+        seen[value] = true
+        local out = {}
+        local count = 0
+        for k, v in pairs(value) do
+            count += 1
+            if count > 512 then
+                out["<truncated>"] = true
+                break
+            end
+            local key = sanitizeString(tostring(k), 512)
+            out[key] = forceJsonSafe(v, depth + 1, seen)
+        end
+        seen[value] = nil
+        return out
     end
 
     local function bridgeUrl(path)
@@ -14321,7 +14355,7 @@ local function main()
     end
 
     local function quotePathName(name)
-        return tostring(name):gsub("\\", "\\\\"):gsub("/", "\\/")
+        return sanitizeString(name, 1024):gsub("\\", "\\\\"):gsub("/", "\\/")
     end
 
     local function buildPath(obj)
@@ -14366,7 +14400,7 @@ local function main()
             current = current.Parent
             guard += 1
         end
-        return last and last.Name or "Unknown"
+        return last and sanitizeString(last.Name, 512) or "Unknown"
     end
 
     local function getAttributes(obj)
@@ -14374,7 +14408,7 @@ local function main()
         local ok, attrs = pcall(obj.GetAttributes, obj)
         if ok and type(attrs) == "table" then
             for name, value in pairs(attrs) do
-                out[name] = serializeValue(value)
+                out[sanitizeString(name, 512)] = serializeValue(value)
             end
         end
         return out
@@ -14384,7 +14418,7 @@ local function main()
         local out = {}
         local ok, tags = pcall(service.CollectionService.GetTags, service.CollectionService, obj)
         if ok and type(tags) == "table" then
-            for i = 1, #tags do out[i] = tags[i] end
+            for i = 1, #tags do out[i] = sanitizeString(tags[i], 1024) end
         end
         return out
     end
@@ -14395,15 +14429,27 @@ local function main()
     end
 
     local function isGuiRelated(obj)
+        local cached = guiCache[obj]
+        if cached ~= nil then return cached end
+
         local okGui, gui = pcall(obj.IsA, obj, "GuiBase2d")
-        if okGui and gui then return true end
+        if okGui and gui then guiCache[obj] = true return true end
         local okLayer, layer = pcall(obj.IsA, obj, "LayerCollector")
-        if okLayer and layer then return true end
+        if okLayer and layer then guiCache[obj] = true return true end
+
         local className = tostring(obj.ClassName or "")
-        if className:sub(1, 2) == "UI" then return true end
-        if className == "StarterGui" or className == "CoreGui" or className == "PlayerGui" then return true end
-        if className == "ViewportFrame" or className == "CanvasGroup" then return true end
-        return false
+        if className:sub(1, 2) == "UI" or className == "StarterGui" or className == "CoreGui"
+            or className == "PlayerGui" or className == "ViewportFrame" or className == "CanvasGroup" then
+            guiCache[obj] = true
+            return true
+        end
+
+        -- Keep structural containers inside a GUI branch too (Folder/Configuration etc.).
+        -- Parent results are cached, so this does not repeatedly walk the whole ancestry.
+        local parent = obj.Parent
+        local result = parent ~= nil and parent ~= game and isGuiRelated(parent) or false
+        guiCache[obj] = result
+        return result
     end
 
     local function getSmartProperties(obj)
@@ -14522,7 +14568,7 @@ local function main()
             path = buildPath(obj),
             parentPath = parentPath,
             name = sanitizeString(obj.Name, 512),
-            className = obj.ClassName,
+            className = sanitizeString(obj.ClassName, 256),
             service = topServiceName(obj),
             depth = depthOf(obj),
             isGui = guiRelated,
@@ -14568,6 +14614,7 @@ local function main()
         local started = os.clock()
         table.clear(pathCache)
         table.clear(sourceCache)
+        table.clear(guiCache)
 
         local healthOk, health = requestBridge("/health", "GET")
         if not healthOk then
@@ -14584,7 +14631,7 @@ local function main()
         local gameName = "Place_" .. tostring(game.PlaceId)
         pcall(function() gameName = service.MarketplaceService:GetProductInfo(game.PlaceId).Name end)
         local requestedSources = type(health) == "table" and health.includeScriptSources == true
-        local chunkSize = tonumber(type(health) == "table" and health.chunkSize) or tonumber(cfg("ChunkSize", 300)) or 300
+        local chunkSize = tonumber(type(health) == "table" and health.chunkSize) or tonumber(cfg("ChunkSize", 180)) or 180
         chunkSize = math.clamp(math.floor(chunkSize), 20, 600)
 
         local beginOk, beginResult = requestBridge("/export/begin", "POST", {
@@ -14616,19 +14663,90 @@ local function main()
         local recordFailures = 0
         local sent = 0
         local uiCount = 0
-        local yieldEvery = math.max(20, tonumber(cfg("YieldEvery", 250)) or 250)
+        local yieldEvery = math.max(20, tonumber(cfg("YieldEvery", 300)) or 300)
+
+        local droppedRecords = 0
+        local recoveredRecords = 0
+
+        local function minimalRecord(record, err)
+            record = type(record) == "table" and record or {}
+            return {
+                path = sanitizeString(record.path or "<unknown>", 4096),
+                parentPath = record.parentPath and sanitizeString(record.parentPath, 4096) or nil,
+                name = sanitizeString(record.name or "<unserializable>", 512),
+                className = sanitizeString(record.className or "Instance", 256),
+                service = sanitizeString(record.service or "Unknown", 512),
+                depth = tonumber(record.depth) or 0,
+                isGui = record.isGui == true,
+                isScript = record.isScript == true,
+                attributes = {},
+                properties = {},
+                exportWarning = "Record was reduced after JSON serialization failure: " .. sanitizeString(err, 2048),
+            }
+        end
+
+        local function sendRecordBatch(batch, processed, allowReduce)
+            if #batch == 0 then return true end
+            local payload = {
+                sessionId = sessionId,
+                processed = processed,
+                total = #objects,
+                stage = mode == "deep" and "Deep-converting Explorer" or "Converting Explorer + full UI",
+                records = batch,
+            }
+
+            -- Preflight locally. If one record poisons a chunk, recursively isolate it.
+            local encoded, encodeErr = jsonEncode(payload)
+            if not encoded then
+                if #batch > 1 then
+                    local mid = math.floor(#batch / 2)
+                    local left, right = {}, {}
+                    for i = 1, mid do left[#left + 1] = batch[i] end
+                    for i = mid + 1, #batch do right[#right + 1] = batch[i] end
+                    local okLeft, errLeft = sendRecordBatch(left, processed, allowReduce)
+                    if not okLeft then return false, errLeft end
+                    return sendRecordBatch(right, processed, allowReduce)
+                end
+
+                local original = batch[1]
+                local normalized = forceJsonSafe(original)
+                local normalizedOk = jsonEncode(normalized)
+                if normalizedOk then
+                    recoveredRecords += 1
+                    return sendRecordBatch({normalized}, processed, false)
+                end
+
+                if allowReduce ~= false then
+                    recoveredRecords += 1
+                    return sendRecordBatch({minimalRecord(original, encodeErr)}, processed, false)
+                end
+
+                droppedRecords += 1
+                return true -- Never abort the complete Explorer because of one bad record.
+            end
+
+            local ok, result = requestBridge("/export/chunk", "POST", payload)
+            if ok then return true end
+
+            -- Request-size/runtime edge case: halve the batch and retry. A genuine bridge
+            -- outage will eventually fail on a single record and is reported normally.
+            if #batch > 1 then
+                local mid = math.floor(#batch / 2)
+                local left, right = {}, {}
+                for i = 1, mid do left[#left + 1] = batch[i] end
+                for i = mid + 1, #batch do right[#right + 1] = batch[i] end
+                local okLeft, errLeft = sendRecordBatch(left, processed, allowReduce)
+                if not okLeft then return false, errLeft end
+                return sendRecordBatch(right, processed, allowReduce)
+            end
+            return false, result
+        end
 
         local function flushRecords(processed)
             if #records == 0 then return true end
             local payloadRecords = records
             records = {}
-            local ok, result = requestBridge("/export/chunk", "POST", {
-                sessionId = sessionId,
-                processed = processed,
-                total = #objects,
-                stage = mode == "deep" and "Deep-converting Explorer" or "Converting Explorer + full UI",
-                records = payloadRecords,
-            })
+            local ok, result = sendRecordBatch(payloadRecords, processed, true)
             if not ok then return false, result end
             sent = processed
             return true
@@ -14643,6 +14761,26 @@ local function main()
                 if record.isScript then scripts[#scripts + 1] = obj end
             else
                 recordFailures += 1
+                local fallbackPath = "<unreadable>"
+                pcall(function() fallbackPath = buildPath(obj) end)
+                local fallbackName = "<unreadable>"
+                local fallbackClass = "Instance"
+                pcall(function() fallbackName = sanitizeString(obj.Name, 512) end)
+                pcall(function() fallbackClass = sanitizeString(obj.ClassName, 256) end)
+                local fallbackDepth, fallbackGui, fallbackScript, fallbackService = 0, false, false, "Unknown"
+                pcall(function() fallbackDepth = depthOf(obj) end)
+                pcall(function() fallbackGui = isGuiRelated(obj) end)
+                pcall(function() fallbackScript = isScriptObject(obj) end)
+                pcall(function() fallbackService = topServiceName(obj) end)
+                local fallback = minimalRecord({
+                    path = fallbackPath, name = fallbackName, className = fallbackClass,
+                    depth = fallbackDepth, isGui = fallbackGui, isScript = fallbackScript,
+                    service = fallbackService,
+                }, tostring(record))
+                records[#records + 1] = fallback
+                recoveredRecords += 1
+                if fallback.isGui then uiCount += 1 end
+                if fallback.isScript then scripts[#scripts + 1] = obj end
             end
 
             if #records >= chunkSize or i == #objects then
@@ -14660,7 +14798,7 @@ local function main()
 
             if i == 1 or i % yieldEvery == 0 or i == #objects then
                 setProgress(i, #objects, mode == "deep" and "Deep-converting Explorer..." or "Converting Explorer + UI...")
-                setDetail(string.format("%d / %d | UI %d | Scripts %d | chunk %d", i, #objects, uiCount, #scripts, chunkSize))
+                setDetail(string.format("%d / %d | UI %d | Scripts %d | recovered %d", i, #objects, uiCount, #scripts, recoveredRecords))
                 task.wait()
             end
         end
@@ -14678,7 +14816,7 @@ local function main()
                         index = i,
                         path = buildPath(obj),
                         name = sanitizeString(obj.Name, 512),
-                        className = obj.ClassName,
+                        className = sanitizeString(obj.ClassName, 256),
                         source = source,
                         stage = string.format("Exporting readable scripts %d/%d", i, #scripts),
                     })
@@ -14698,7 +14836,9 @@ local function main()
             sessionId = sessionId,
             processed = #objects,
             total = #objects,
-            failures = recordFailures + sourceFailures,
+            failures = recordFailures + sourceFailures + droppedRecords,
+            recoveredRecords = recoveredRecords,
+            droppedRecords = droppedRecords,
             uiCount = uiCount,
             scriptCount = #scripts,
             sourceCount = sourceExported,
@@ -14982,10 +15122,10 @@ DefaultSettings = (function()
 		Exporter = {
 			_Recurse = true,
 			BridgeUrl = "http://127.0.0.1:32189",
-			ChunkSize = 300,
+			ChunkSize = 180,
 			IncludeNilInstances = true,
 			MaxStringLength = 32768,
-			YieldEvery = 250,
+			YieldEvery = 300,
 		},
 		Window = {
 			TitleOnMiddle = false,
