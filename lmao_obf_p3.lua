@@ -30,7 +30,13 @@
 -- Bootstrap
 -- ============================================================
 
-local ENV = (getgenv and getgenv()) or _G
+local ENV = _G
+if type(getgenv) == "function" then
+    local okEnv, customEnv = pcall(getgenv)
+    if okEnv and type(customEnv) == "table" then
+        ENV = customEnv
+    end
+end
 
 if ENV.__SON_HUB_UNLOAD then
     pcall(ENV.__SON_HUB_UNLOAD)
@@ -52,484 +58,221 @@ local Workspace = workspace
 
 
 -- ============================================================
--- SON UI Core
--- Self-contained UI. No Pastefy/GitHub/CDN Lua dependency.
+-- Fluent UI Adapter
+-- Official Fluent release + compatibility wrapper for SON HUB.
+-- No SaveManager / InterfaceManager: those addons require filesystem UNC.
 -- ============================================================
 
+local FLUENT_URL =
+    "https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua"
+
+local ExecutorCaps = {
+    Loadstring = type(loadstring) == "function",
+    HttpGet = false,
+    FirePrompt = type(fireproximityprompt) == "function",
+    FireSignal = type(firesignal) == "function",
+    Clipboard =
+        type(rawget(ENV, "setclipboard")) == "function"
+        or type(rawget(_G, "setclipboard")) == "function",
+}
+
 do
-    local UI = {}
-    UI.__index = UI
+    local ok = pcall(function()
+        ExecutorCaps.HttpGet = type(game.HttpGet) == "function"
+    end)
 
-    local Theme = {
-        Background = Color3.fromRGB(14, 16, 21),
-        Surface = Color3.fromRGB(21, 24, 31),
-        Surface2 = Color3.fromRGB(28, 32, 41),
-        Stroke = Color3.fromRGB(52, 59, 73),
-        Text = Color3.fromRGB(239, 242, 248),
-        Muted = Color3.fromRGB(151, 160, 178),
-        Accent = Color3.fromRGB(82, 147, 255),
-        AccentSoft = Color3.fromRGB(48, 83, 139),
-        Success = Color3.fromRGB(72, 201, 132),
-        Danger = Color3.fromRGB(255, 95, 103),
-    }
+    if not ok then
+        ExecutorCaps.HttpGet = false
+    end
+end
 
-    local function corner(parent, radius)
-        local object = Instance.new("UICorner")
-        object.CornerRadius = UDim.new(0, radius or 8)
-        object.Parent = parent
-        return object
+local function loadFluent()
+    if not ExecutorCaps.Loadstring then
+        return nil, "executor does not expose loadstring"
     end
 
-    local function stroke(parent, transparency)
-        local object = Instance.new("UIStroke")
-        object.Color = Theme.Stroke
-        object.Transparency = transparency or 0.25
-        object.Thickness = 1
-        object.Parent = parent
-        return object
+    if not ExecutorCaps.HttpGet then
+        return nil, "executor does not expose game:HttpGet"
     end
 
-    local function padding(parent, l, r, t, b)
-        local object = Instance.new("UIPadding")
-        object.PaddingLeft = UDim.new(0, l or 0)
-        object.PaddingRight = UDim.new(0, r or l or 0)
-        object.PaddingTop = UDim.new(0, t or l or 0)
-        object.PaddingBottom = UDim.new(0, b or t or l or 0)
-        object.Parent = parent
-        return object
+    local okBody, body = pcall(function()
+        return game:HttpGet(FLUENT_URL)
+    end)
+
+    if not okBody or type(body) ~= "string" or #body < 1000 then
+        return nil, "failed to download Fluent release"
     end
 
-    local function textLabel(parent, text, size, color, bold)
-        local label = Instance.new("TextLabel")
-        label.BackgroundTransparency = 1
-        label.Text = text or ""
-        label.TextColor3 = color or Theme.Text
-        label.TextSize = size or 14
-        label.Font = bold and Enum.Font.GothamSemibold or Enum.Font.Gotham
-        label.TextXAlignment = Enum.TextXAlignment.Left
-        label.TextYAlignment = Enum.TextYAlignment.Center
-        label.TextWrapped = true
-        label.Parent = parent
-        return label
+    local chunk, compileError = loadstring(body)
+    if type(chunk) ~= "function" then
+        return nil, "Fluent compile failed: " .. tostring(compileError)
     end
 
-    local function buttonBase(parent, text)
-        local button = Instance.new("TextButton")
-        button.AutoButtonColor = false
-        button.BackgroundColor3 = Theme.Surface2
-        button.Text = text or ""
-        button.TextColor3 = Theme.Text
-        button.TextSize = 13
-        button.Font = Enum.Font.GothamMedium
-        button.Parent = parent
-        corner(button, 7)
-        stroke(button, 0.35)
-        return button
+    local okLibrary, library = pcall(chunk)
+    if not okLibrary or type(library) ~= "table" then
+        return nil, "Fluent init failed: " .. tostring(library)
     end
 
-    local function safeCall(callback, ...)
-        if type(callback) ~= "function" then
-            return
-        end
-        task.spawn(function(...)
-            pcall(callback, ...)
-        end, ...)
+    return library
+end
+
+local Fluent, FluentLoadError = loadFluent()
+
+if not Fluent then
+    error(
+        "SON HUB v8 could not load Fluent UI: "
+            .. tostring(FluentLoadError)
+            .. ". Nexomia needs loadstring + game:HttpGet for Fluent."
+    )
+end
+
+local Library = {}
+
+local function safeCallback(callback, ...)
+    if type(callback) ~= "function" then
+        return
     end
 
-    local function addHover(button, normal, hover)
-        button.MouseEnter:Connect(function()
-            TweenService:Create(
-                button,
-                TweenInfo.new(0.12, Enum.EasingStyle.Quad),
-                {BackgroundColor3 = hover}
-            ):Play()
-        end)
+    local args = table.pack(...)
 
-        button.MouseLeave:Connect(function()
-            TweenService:Create(
-                button,
-                TweenInfo.new(0.12, Enum.EasingStyle.Quad),
-                {BackgroundColor3 = normal}
-            ):Play()
-        end)
-    end
-
-    Library = {
-        _notifications = nil,
-    }
-
-    function Library:Notify(data)
-        local title = tostring((data and data.Title) or "SON HUB")
-        local description = tostring((data and data.Description) or "")
-        local duration = tonumber(data and data.Duration) or 3
-
-        if not self._notifications or not self._notifications.Parent then
-            return
-        end
-
-        local card = Instance.new("Frame")
-        card.BackgroundColor3 = Theme.Surface
-        card.BackgroundTransparency = 0.03
-        card.Size = UDim2.new(0, 320, 0, 0)
-        card.AutomaticSize = Enum.AutomaticSize.Y
-        card.Parent = self._notifications
-        corner(card, 9)
-        stroke(card, 0.15)
-        padding(card, 12, 12, 10, 10)
-
-        local layout = Instance.new("UIListLayout")
-        layout.Padding = UDim.new(0, 4)
-        layout.Parent = card
-
-        local titleLabel = textLabel(card, title, 14, Theme.Text, true)
-        titleLabel.Size = UDim2.new(1, 0, 0, 20)
-
-        local body = textLabel(card, description, 12, Theme.Muted, false)
-        body.Size = UDim2.new(1, 0, 0, 0)
-        body.AutomaticSize = Enum.AutomaticSize.Y
-        body.TextYAlignment = Enum.TextYAlignment.Top
-
-        card.BackgroundTransparency = 1
-        titleLabel.TextTransparency = 1
-        body.TextTransparency = 1
-
-        TweenService:Create(card, TweenInfo.new(0.16), {BackgroundTransparency = 0.03}):Play()
-        TweenService:Create(titleLabel, TweenInfo.new(0.16), {TextTransparency = 0}):Play()
-        TweenService:Create(body, TweenInfo.new(0.16), {TextTransparency = 0}):Play()
-
-        task.delay(duration, function()
-            if not card.Parent then
-                return
-            end
-
-            TweenService:Create(card, TweenInfo.new(0.18), {BackgroundTransparency = 1}):Play()
-            TweenService:Create(titleLabel, TweenInfo.new(0.18), {TextTransparency = 1}):Play()
-            TweenService:Create(body, TweenInfo.new(0.18), {TextTransparency = 1}):Play()
-
-            task.delay(0.2, function()
-                pcall(function()
-                    card:Destroy()
-                end)
-            end)
-        end)
-    end
-
-    function Library:CreateWindow(config)
-        config = config or {}
-
-        local gui = Instance.new("ScreenGui")
-        gui.Name = "SON_HUB_UI"
-        gui.IgnoreGuiInset = false
-        gui.ResetOnSpawn = false
-        gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-
-        local guiParent
+    task.spawn(function()
         pcall(function()
-            guiParent = CoreGui
-            gui.Parent = CoreGui
+            callback(table.unpack(args, 1, args.n))
         end)
+    end)
+end
 
-        if not gui.Parent then
-            guiParent = LocalPlayer:WaitForChild("PlayerGui")
-            gui.Parent = guiParent
-        end
+local function cleanTabTitle(title)
+    title = tostring(title or "")
+    title = title:gsub("^%s*[⌂⚔☠➤☺✦✧❖🏠💀🏃👤📜⚙️ℹ️]+%s*", "")
+    return title
+end
 
-        local main = Instance.new("Frame")
-        main.Name = "Window"
-        main.BackgroundColor3 = Theme.Background
-        main.Size = UDim2.fromOffset(760, 520)
-        main.Position = UDim2.new(0.5, -380, 0.5, -260)
-        main.ClipsDescendants = true
-        main.Parent = gui
-        corner(main, 11)
-        stroke(main, 0.05)
+local function iconForTitle(title)
+    local value = string.lower(cleanTabTitle(title))
 
-        local topbar = Instance.new("Frame")
-        topbar.BackgroundColor3 = Theme.Surface
-        topbar.Size = UDim2.new(1, 0, 0, 58)
-        topbar.Parent = main
+    if value:find("trang chủ", 1, true) or value:find("home", 1, true) then
+        return "home"
+    elseif value:find("farm", 1, true) then
+        return "target"
+    elseif value:find("combat", 1, true) then
+        return "shield"
+    elseif value:find("movement", 1, true) then
+        return "move"
+    elseif value:find("player", 1, true) then
+        return "user"
+    elseif value:find("quest", 1, true) then
+        return "scroll"
+    elseif value:find("settings", 1, true) or value:find("cài", 1, true) then
+        return "settings"
+    elseif value:find("info", 1, true) or value:find("thông tin", 1, true) then
+        return "info"
+    end
 
-        local logo = Instance.new("Frame")
-        logo.BackgroundColor3 = Theme.Accent
-        logo.Size = UDim2.fromOffset(34, 34)
-        logo.Position = UDim2.fromOffset(14, 12)
-        logo.Parent = topbar
-        corner(logo, 9)
+    return ""
+end
 
-        local logoText = textLabel(logo, "S", 17, Color3.new(1, 1, 1), true)
-        logoText.Size = UDim2.fromScale(1, 1)
-        logoText.TextXAlignment = Enum.TextXAlignment.Center
+local ElementCounter = 0
 
-        local title = textLabel(
-            topbar,
-            tostring(config.Title or "SON HUB"),
-            17,
-            Theme.Text,
-            true
-        )
-        title.Position = UDim2.fromOffset(60, 9)
-        title.Size = UDim2.new(1, -150, 0, 22)
+local function nextId(prefix)
+    ElementCounter += 1
+    return string.format(
+        "SON_%s_%04d",
+        tostring(prefix or "Option"):gsub("[^%w_]", "_"),
+        ElementCounter
+    )
+end
 
-        local subtitle = textLabel(
-            topbar,
-            tostring(config.Subtitle or "make by hongson"),
-            11,
-            config.SubtitleColor or Theme.Muted,
-            false
-        )
-        subtitle.Position = UDim2.fromOffset(60, 31)
-        subtitle.Size = UDim2.new(1, -150, 0, 18)
+function Library:Notify(data)
+    data = data or {}
 
-        local minimize = buttonBase(topbar, "—")
-        minimize.Size = UDim2.fromOffset(32, 28)
-        minimize.Position = UDim2.new(1, -76, 0, 15)
+    pcall(function()
+        Fluent:Notify({
+            Title = tostring(data.Title or "SON HUB"),
+            Content = tostring(data.Description or data.Content or ""),
+            SubContent = tostring(data.SubContent or ""),
+            Duration = tonumber(data.Duration) or 4,
+        })
+    end)
+end
 
-        local close = buttonBase(topbar, "×")
-        close.Size = UDim2.fromOffset(32, 28)
-        close.Position = UDim2.new(1, -40, 0, 15)
-        close.TextSize = 17
+function Library:CreateWindow(config)
+    config = config or {}
 
-        addHover(minimize, Theme.Surface2, Theme.AccentSoft)
-        addHover(close, Theme.Surface2, Theme.Danger)
+    local NativeWindow = Fluent:CreateWindow({
+        Title = tostring(config.Title or "SON HUB"),
+        SubTitle = tostring(config.Subtitle or config.SubTitle or "make by hongson"),
+        TabWidth = 150,
+        Size = UDim2.fromOffset(760, 520),
+        Acrylic = false,
+        Theme = "Dark",
+        MinimizeKey = Enum.KeyCode.LeftControl,
+    })
 
-        local sidebar = Instance.new("Frame")
-        sidebar.BackgroundColor3 = Theme.Surface
-        sidebar.Position = UDim2.fromOffset(0, 58)
-        sidebar.Size = UDim2.new(0, 168, 1, -58)
-        sidebar.Parent = main
+    local Window = {
+        Native = NativeWindow,
+        Tabs = {},
+    }
 
-        local sidebarPad = padding(sidebar, 9, 9, 10, 10)
+    function Window:SetTransparency(value)
+        pcall(function()
+            Fluent:ToggleTransparency((tonumber(value) or 0) > 0)
+        end)
+    end
 
-        local tabList = Instance.new("UIListLayout")
-        tabList.Padding = UDim.new(0, 5)
-        tabList.SortOrder = Enum.SortOrder.LayoutOrder
-        tabList.Parent = sidebar
+    function Window:CreateTab(title, selectedByDefault)
+        local cleanTitle = cleanTabTitle(title)
 
-        local content = Instance.new("Frame")
-        content.BackgroundTransparency = 1
-        content.Position = UDim2.fromOffset(168, 58)
-        content.Size = UDim2.new(1, -168, 1, -58)
-        content.Parent = main
+        local NativeTab = NativeWindow:AddTab({
+            Title = cleanTitle,
+            Icon = iconForTitle(cleanTitle),
+        })
 
-        local notifications = Instance.new("Frame")
-        notifications.BackgroundTransparency = 1
-        notifications.AnchorPoint = Vector2.new(1, 0)
-        notifications.Position = UDim2.new(1, -14, 0, 72)
-        notifications.Size = UDim2.fromOffset(330, 400)
-        notifications.Parent = gui
-
-        local notificationLayout = Instance.new("UIListLayout")
-        notificationLayout.HorizontalAlignment = Enum.HorizontalAlignment.Right
-        notificationLayout.VerticalAlignment = Enum.VerticalAlignment.Top
-        notificationLayout.Padding = UDim.new(0, 8)
-        notificationLayout.Parent = notifications
-
-        Library._notifications = notifications
-
-        local window = {
-            Gui = gui,
-            Main = main,
-            Title = title,
-            Sidebar = sidebar,
-            Content = content,
-            Tabs = {},
-            Selected = nil,
-            _transparent = 0,
+        local Tab = {
+            Native = NativeTab,
+            Title = cleanTitle,
+            PageCount = 0,
         }
 
-        local dragging = false
-        local dragStart
-        local startPosition
+        function Tab:CreatePage(pageName)
+            self.PageCount += 1
 
-        topbar.InputBegan:Connect(function(input)
-            if input.UserInputType == Enum.UserInputType.MouseButton1
-                or input.UserInputType == Enum.UserInputType.Touch then
-                dragging = true
-                dragStart = input.Position
-                startPosition = main.Position
-            end
-        end)
-
-        topbar.InputEnded:Connect(function(input)
-            if input.UserInputType == Enum.UserInputType.MouseButton1
-                or input.UserInputType == Enum.UserInputType.Touch then
-                dragging = false
-            end
-        end)
-
-        UserInputService.InputChanged:Connect(function(input)
-            if not dragging then
-                return
+            local pageTitle = tostring(pageName or "")
+            if pageTitle ~= "" then
+                pcall(function()
+                    NativeTab:AddParagraph({
+                        Title = pageTitle,
+                        Content = "",
+                    })
+                end)
             end
 
-            if input.UserInputType ~= Enum.UserInputType.MouseMovement
-                and input.UserInputType ~= Enum.UserInputType.Touch then
-                return
-            end
+            local Page = {}
 
-            local delta = input.Position - dragStart
+            function Page:CreateSection(sectionName)
+                local NativeSection = NativeTab:AddSection(tostring(sectionName or "Section"))
+                local Section = {}
 
-            main.Position = UDim2.new(
-                startPosition.X.Scale,
-                startPosition.X.Offset + delta.X,
-                startPosition.Y.Scale,
-                startPosition.Y.Offset + delta.Y
-            )
-        end)
+                function Section:AddButton(label, callback, meta)
+                    meta = meta or {}
 
-        local minimized = false
-        minimize.MouseButton1Click:Connect(function()
-            minimized = not minimized
-
-            if minimized then
-                main.Size = UDim2.fromOffset(760, 58)
-                sidebar.Visible = false
-                content.Visible = false
-            else
-                main.Size = UDim2.fromOffset(760, 520)
-                sidebar.Visible = true
-                content.Visible = true
-            end
-        end)
-
-        close.MouseButton1Click:Connect(function()
-            gui.Enabled = false
-        end)
-
-        function window:SetTransparency(value)
-            self._transparent = tonumber(value) or 0
-
-            main.BackgroundTransparency = self._transparent
-            topbar.BackgroundTransparency = self._transparent
-            sidebar.BackgroundTransparency = self._transparent
-        end
-
-        function window:CreateTab(name, selectedByDefault)
-            local button = buttonBase(sidebar, tostring(name))
-            button.Size = UDim2.new(1, 0, 0, 36)
-            button.TextXAlignment = Enum.TextXAlignment.Left
-            button.TextSize = 12
-            padding(button, 11, 8, 0, 0)
-
-            local page = Instance.new("ScrollingFrame")
-            page.Name = tostring(name)
-            page.BackgroundTransparency = 1
-            page.BorderSizePixel = 0
-            page.Size = UDim2.fromScale(1, 1)
-            page.ScrollBarThickness = 4
-            page.ScrollBarImageColor3 = Theme.AccentSoft
-            page.CanvasSize = UDim2.new()
-            page.AutomaticCanvasSize = Enum.AutomaticSize.Y
-            page.Visible = false
-            page.Parent = content
-            padding(page, 14, 14, 14, 18)
-
-            local pageLayout = Instance.new("UIListLayout")
-            pageLayout.SortOrder = Enum.SortOrder.LayoutOrder
-            pageLayout.Padding = UDim.new(0, 10)
-            pageLayout.Parent = page
-
-            local tab = {
-                Button = button,
-                Container = page,
-                _lastPageHeader = nil,
-            }
-
-            function tab:_select()
-                if window.Selected == self then
-                    return
+                    return NativeSection:AddButton({
+                        Title = tostring(meta.Title or label),
+                        Description = tostring(meta.Description or ""),
+                        Callback = function()
+                            safeCallback(callback)
+                        end,
+                    })
                 end
 
-                for _, other in ipairs(window.Tabs) do
-                    other.Container.Visible = false
-                    other.Button.BackgroundColor3 = Theme.Surface2
-                    other.Button.TextColor3 = Theme.Muted
-                end
+                function Section:AddCopyButton(label, value, meta)
+                    meta = meta or {}
 
-                self.Container.Visible = true
-                self.Button.BackgroundColor3 = Theme.AccentSoft
-                self.Button.TextColor3 = Theme.Text
-                window.Selected = self
-            end
-
-            button.MouseButton1Click:Connect(function()
-                tab:_select()
-            end)
-
-            function tab:CreatePage(pageName)
-                -- Pages are deliberately rendered as headers in one scrolling
-                -- tab. This avoids nested page navigation and scattered controls.
-                if pageName and pageName ~= "" then
-                    local header = textLabel(
-                        self.Container,
-                        tostring(pageName),
-                        15,
-                        Theme.Text,
-                        true
-                    )
-                    header.Size = UDim2.new(1, -4, 0, 26)
-                    header.LayoutOrder = 100 + #self.Container:GetChildren()
-                    self._lastPageHeader = header
-                end
-
-                local pageApi = {}
-
-                function pageApi:CreateSection(sectionName)
-                    local section = Instance.new("Frame")
-                    section.BackgroundColor3 = Theme.Surface
-                    section.Size = UDim2.new(1, -4, 0, 0)
-                    section.AutomaticSize = Enum.AutomaticSize.Y
-                    section.Parent = tab.Container
-                    corner(section, 9)
-                    stroke(section, 0.30)
-                    padding(section, 10, 10, 10, 10)
-
-                    local sectionLayout = Instance.new("UIListLayout")
-                    sectionLayout.Padding = UDim.new(0, 7)
-                    sectionLayout.SortOrder = Enum.SortOrder.LayoutOrder
-                    sectionLayout.Parent = section
-
-                    local sectionTitle = textLabel(
-                        section,
-                        tostring(sectionName or "Section"),
-                        13,
-                        Theme.Text,
-                        true
-                    )
-                    sectionTitle.Size = UDim2.new(1, 0, 0, 20)
-
-                    local api = {}
-
-                    local function addMeta(meta)
-                        if not meta or not meta.Description then
-                            return
-                        end
-
-                        local description = textLabel(
-                            section,
-                            tostring(meta.Description),
-                            10,
-                            Theme.Muted,
-                            false
-                        )
-                        description.Size = UDim2.new(1, 0, 0, 0)
-                        description.AutomaticSize = Enum.AutomaticSize.Y
-                    end
-
-                    function api:AddButton(label, callback, meta)
-                        local button = buttonBase(section, tostring(label))
-                        button.Size = UDim2.new(1, 0, 0, 34)
-                        addHover(button, Theme.Surface2, Theme.AccentSoft)
-                        button.MouseButton1Click:Connect(function()
-                            safeCall(callback)
-                        end)
-                        addMeta(meta)
-                        return button
-                    end
-
-                    function api:AddCopyButton(label, value, meta)
-                        return self:AddButton(label, function()
-                            local clipboard = rawget(ENV, "setclipboard")
+                    return self:AddButton(
+                        label,
+                        function()
+                            local clipboard =
+                                rawget(ENV, "setclipboard")
                                 or rawget(_G, "setclipboard")
 
                             if type(clipboard) == "function" then
@@ -539,290 +282,147 @@ do
                                     Description = tostring(label),
                                     Duration = 2,
                                 })
+                            else
+                                Library:Notify({
+                                    Title = "Clipboard unavailable",
+                                    Description =
+                                        "Nexomia does not expose setclipboard here.",
+                                    Duration = 4,
+                                })
                             end
-                        end, meta)
-                    end
-
-                    function api:AddToggle(label, default, callback, meta)
-                        local row = Instance.new("Frame")
-                        row.BackgroundColor3 = Theme.Surface2
-                        row.Size = UDim2.new(1, 0, 0, 38)
-                        row.Parent = section
-                        corner(row, 7)
-
-                        local nameLabel = textLabel(row, tostring(label), 12, Theme.Text, false)
-                        nameLabel.Position = UDim2.fromOffset(10, 0)
-                        nameLabel.Size = UDim2.new(1, -62, 1, 0)
-
-                        local toggle = buttonBase(row, "")
-                        toggle.Size = UDim2.fromOffset(38, 22)
-                        toggle.Position = UDim2.new(1, -48, 0.5, -11)
-
-                        local knob = Instance.new("Frame")
-                        knob.Size = UDim2.fromOffset(16, 16)
-                        knob.Position = UDim2.fromOffset(3, 3)
-                        knob.BackgroundColor3 = Theme.Text
-                        knob.Parent = toggle
-                        corner(knob, 8)
-
-                        local state = default == true
-
-                        local function render(fire)
-                            toggle.BackgroundColor3 = state and Theme.Accent or Theme.Stroke
-
-                            TweenService:Create(
-                                knob,
-                                TweenInfo.new(0.12),
-                                {
-                                    Position = state
-                                        and UDim2.fromOffset(19, 3)
-                                        or UDim2.fromOffset(3, 3),
-                                }
-                            ):Play()
-
-                            if fire then
-                                safeCall(callback, state)
-                            end
-                        end
-
-                        toggle.MouseButton1Click:Connect(function()
-                            state = not state
-                            render(true)
-                        end)
-
-                        render(false)
-                        addMeta(meta)
-
-                        return {
-                            Set = function(_, value)
-                                state = value == true
-                                render(true)
-                            end,
-                            Get = function()
-                                return state
-                            end,
-                        }
-                    end
-
-                    function api:AddSlider(label, minimum, maximum, default, callback, meta)
-                        minimum = tonumber(minimum) or 0
-                        maximum = tonumber(maximum) or 100
-                        local value = math.clamp(tonumber(default) or minimum, minimum, maximum)
-
-                        local box = Instance.new("Frame")
-                        box.BackgroundColor3 = Theme.Surface2
-                        box.Size = UDim2.new(1, 0, 0, 58)
-                        box.Parent = section
-                        corner(box, 7)
-
-                        local nameLabel = textLabel(box, tostring(label), 11, Theme.Text, false)
-                        nameLabel.Position = UDim2.fromOffset(10, 3)
-                        nameLabel.Size = UDim2.new(1, -70, 0, 22)
-
-                        local valueLabel = textLabel(box, tostring(value), 11, Theme.Accent, true)
-                        valueLabel.Position = UDim2.new(1, -60, 0, 3)
-                        valueLabel.Size = UDim2.fromOffset(50, 22)
-                        valueLabel.TextXAlignment = Enum.TextXAlignment.Right
-
-                        local track = Instance.new("Frame")
-                        track.BackgroundColor3 = Theme.Stroke
-                        track.Position = UDim2.fromOffset(10, 36)
-                        track.Size = UDim2.new(1, -20, 0, 8)
-                        track.Parent = box
-                        corner(track, 4)
-
-                        local fill = Instance.new("Frame")
-                        fill.BackgroundColor3 = Theme.Accent
-                        fill.Size = UDim2.new(0, 0, 1, 0)
-                        fill.Parent = track
-                        corner(fill, 4)
-
-                        local draggingSlider = false
-
-                        local function setValueFromX(x, fire)
-                            local ratio = math.clamp(
-                                (x - track.AbsolutePosition.X)
-                                    / math.max(1, track.AbsoluteSize.X),
-                                0,
-                                1
-                            )
-
-                            value = math.floor(
-                                minimum + (maximum - minimum) * ratio + 0.5
-                            )
-
-                            local normalized = (value - minimum)
-                                / math.max(1, maximum - minimum)
-
-                            fill.Size = UDim2.new(normalized, 0, 1, 0)
-                            valueLabel.Text = tostring(value)
-
-                            if fire then
-                                safeCall(callback, value)
-                            end
-                        end
-
-                        track.InputBegan:Connect(function(input)
-                            if input.UserInputType == Enum.UserInputType.MouseButton1
-                                or input.UserInputType == Enum.UserInputType.Touch then
-                                draggingSlider = true
-                                setValueFromX(input.Position.X, true)
-                            end
-                        end)
-
-                        UserInputService.InputChanged:Connect(function(input)
-                            if not draggingSlider then
-                                return
-                            end
-
-                            if input.UserInputType == Enum.UserInputType.MouseMovement
-                                or input.UserInputType == Enum.UserInputType.Touch then
-                                setValueFromX(input.Position.X, true)
-                            end
-                        end)
-
-                        UserInputService.InputEnded:Connect(function(input)
-                            if input.UserInputType == Enum.UserInputType.MouseButton1
-                                or input.UserInputType == Enum.UserInputType.Touch then
-                                draggingSlider = false
-                            end
-                        end)
-
-                        local normalized = (value - minimum)
-                            / math.max(1, maximum - minimum)
-                        fill.Size = UDim2.new(normalized, 0, 1, 0)
-
-                        addMeta(meta)
-                        return box
-                    end
-
-                    function api:AddDropdown(label, options, multi, callback, meta)
-                        options = type(options) == "table" and options or {}
-                        local box = Instance.new("Frame")
-                        box.BackgroundColor3 = Theme.Surface2
-                        box.Size = UDim2.new(1, 0, 0, 38)
-                        box.AutomaticSize = Enum.AutomaticSize.Y
-                        box.Parent = section
-                        corner(box, 7)
-
-                        local layout = Instance.new("UIListLayout")
-                        layout.Padding = UDim.new(0, 3)
-                        layout.Parent = box
-
-                        local header = buttonBase(box, tostring(label))
-                        header.Size = UDim2.new(1, 0, 0, 38)
-                        header.TextXAlignment = Enum.TextXAlignment.Left
-                        padding(header, 10, 10, 0, 0)
-
-                        local selected = options[1]
-                        local open = false
-
-                        local menu = Instance.new("Frame")
-                        menu.BackgroundTransparency = 1
-                        menu.Size = UDim2.new(1, 0, 0, 0)
-                        menu.AutomaticSize = Enum.AutomaticSize.Y
-                        menu.Visible = false
-                        menu.Parent = box
-
-                        local menuLayout = Instance.new("UIListLayout")
-                        menuLayout.Padding = UDim.new(0, 3)
-                        menuLayout.Parent = menu
-
-                        local function updateHeader()
-                            header.Text = tostring(label)
-                                .. "  ·  "
-                                .. tostring(selected or "None")
-                        end
-
-                        for _, option in ipairs(options) do
-                            local optionValue = option
-                            local optionButton = buttonBase(menu, tostring(optionValue))
-                            optionButton.Size = UDim2.new(1, 0, 0, 30)
-                            optionButton.TextXAlignment = Enum.TextXAlignment.Left
-                            padding(optionButton, 13, 8, 0, 0)
-                            addHover(optionButton, Theme.Surface2, Theme.AccentSoft)
-
-                            optionButton.MouseButton1Click:Connect(function()
-                                selected = optionValue
-                                updateHeader()
-                                menu.Visible = false
-                                open = false
-                                safeCall(callback, selected)
-                            end)
-                        end
-
-                        header.MouseButton1Click:Connect(function()
-                            open = not open
-                            menu.Visible = open
-                        end)
-
-                        updateHeader()
-                        addMeta(meta)
-
-                        return {
-                            Get = function()
-                                return selected
-                            end,
-                        }
-                    end
-
-                    function api:AddConfigManager(name)
-                        local configName = tostring(name or "son_hub")
-                        local row = Instance.new("Frame")
-                        row.BackgroundTransparency = 1
-                        row.Size = UDim2.new(1, 0, 0, 34)
-                        row.Parent = section
-
-                        local save = buttonBase(row, "Save Config")
-                        save.Size = UDim2.new(0.5, -4, 1, 0)
-
-                        local load = buttonBase(row, "Load Config")
-                        load.Position = UDim2.new(0.5, 4, 0, 0)
-                        load.Size = UDim2.new(0.5, -4, 1, 0)
-
-                        save.MouseButton1Click:Connect(function()
-                            Library:Notify({
-                                Title = "Config",
-                                Description = configName
-                                    .. " uses live toggle values in this self-contained build.",
-                                Duration = 3,
-                            })
-                        end)
-
-                        load.MouseButton1Click:Connect(function()
-                            Library:Notify({
-                                Title = "Config",
-                                Description = "Reload the script for a clean default state.",
-                                Duration = 3,
-                            })
-                        end)
-
-                        return row
-                    end
-
-                    return api
+                        end,
+                        meta
+                    )
                 end
 
-                return pageApi
+                function Section:AddToggle(label, default, callback, meta)
+                    meta = meta or {}
+                    local id = nextId(label)
+
+                    local option = NativeSection:AddToggle(id, {
+                        Title = tostring(meta.Title or label),
+                        Description = tostring(meta.Description or ""),
+                        Default = default == true,
+                    })
+
+                    option:OnChanged(function()
+                        safeCallback(callback, option.Value)
+                    end)
+
+                    return option
+                end
+
+                function Section:AddSlider(label, minimum, maximum, default, callback, meta)
+                    meta = meta or {}
+                    local id = nextId(label)
+
+                    return NativeSection:AddSlider(id, {
+                        Title = tostring(meta.Title or label),
+                        Description = tostring(meta.Description or ""),
+                        Default = tonumber(default) or tonumber(minimum) or 0,
+                        Min = tonumber(minimum) or 0,
+                        Max = tonumber(maximum) or 100,
+                        Rounding = 0,
+                        Callback = function(value)
+                            safeCallback(callback, value)
+                        end,
+                    })
+                end
+
+                function Section:AddDropdown(label, values, multi, callback, meta)
+                    meta = meta or {}
+                    values = type(values) == "table" and values or {}
+                    local id = nextId(label)
+
+                    local option = NativeSection:AddDropdown(id, {
+                        Title = tostring(meta.Title or label),
+                        Description = tostring(meta.Description or ""),
+                        Values = values,
+                        Multi = multi == true,
+                        Default = (#values > 0) and 1 or nil,
+                    })
+
+                    option:OnChanged(function(value)
+                        safeCallback(callback, value)
+                    end)
+
+                    return option
+                end
+
+                function Section:AddColorPicker(label, default, callback, meta)
+                    meta = meta or {}
+                    local id = nextId(label)
+
+                    local option = NativeSection:AddColorpicker(id, {
+                        Title = tostring(meta.Title or label),
+                        Default = default or Color3.new(1, 1, 1),
+                    })
+
+                    option:OnChanged(function()
+                        safeCallback(callback, option.Value)
+                    end)
+
+                    return option
+                end
+
+                function Section:AddTextbox(label, placeholder, callback, meta)
+                    meta = meta or {}
+                    local id = nextId(label)
+
+                    return NativeSection:AddInput(id, {
+                        Title = tostring(meta.Title or label),
+                        Default = "",
+                        Placeholder = tostring(placeholder or ""),
+                        Numeric = false,
+                        Finished = true,
+                        Callback = function(value)
+                            safeCallback(callback, value)
+                        end,
+                    })
+                end
+
+                function Section:AddConfigManager(name)
+                    return NativeSection:AddButton({
+                        Title = "Runtime Config",
+                        Description =
+                            "Filesystem SaveManager disabled for low-sUNC compatibility ("
+                            .. tostring(name or "son_hub")
+                            .. ").",
+                        Callback = function()
+                            Library:Notify({
+                                Title = "Compatibility Mode",
+                                Description =
+                                    "Config stays in memory; file addons are disabled.",
+                                Duration = 5,
+                            })
+                        end,
+                    })
+                end
+
+                return Section
             end
 
-            table.insert(window.Tabs, tab)
-
-            if selectedByDefault or not window.Selected then
-                task.defer(function()
-                    tab:_select()
-                end)
-            end
-
-            return tab
+            return Page
         end
 
-        return window
+        table.insert(Window.Tabs, Tab)
+
+        if selectedByDefault then
+            task.defer(function()
+                pcall(function()
+                    NativeWindow:SelectTab(1)
+                end)
+            end)
+        end
+
+        return Tab
     end
+
+    return Window
 end
 
 local EXPECTED_PLACE_ID = 118635363908336
-local VERSION = "7.0.0"
+local VERSION = "8.0.0"
 
 local SON_ICON_URL = "https://cdn.discordapp.com/attachments/1522131539696160882/1544607843666231326/ChatGPT_Image_Jun_14_2026_10_34_47_PM.png?ex=6a991fa7&is=6a97ce27&hm=486693cbb9841a7bdd2743b8af49abd2238e80fc00ac3bd8e55c73857ef9fff6"
 local FALLBACK_ICON = "rbxassetid://82367817676382"
@@ -6001,6 +5601,30 @@ InterfaceCard:AddToggle("Glass UI", false, function(value)
     Window:SetTransparency(value and 0.18 or 0)
 end)
 
+local CompatibilityCard = SettingsPage:CreateSection("Executor Compatibility")
+
+CompatibilityCard:AddButton("Show Nexomia Capabilities", function()
+    notify(
+        "Executor Capabilities",
+        table.concat({
+            "loadstring: " .. tostring(ExecutorCaps.Loadstring),
+            "game:HttpGet: " .. tostring(ExecutorCaps.HttpGet),
+            "fireproximityprompt: " .. tostring(ExecutorCaps.FirePrompt),
+            "firesignal: " .. tostring(ExecutorCaps.FireSignal),
+            "setclipboard: " .. tostring(ExecutorCaps.Clipboard),
+            "",
+            "Fluent loaded: true",
+            "SaveManager filesystem addons: disabled",
+        }, "\n"),
+        9
+    )
+end, {
+    Title = "Compatibility Check",
+    Description =
+        "Missing optional executor functions use fallback/disabled paths "
+        .. "instead of crashing the full hub.",
+})
+
 local ConfigCard = SettingsPage:CreateSection("Config")
 ConfigCard:AddConfigManager("son_hub_v7")
 
@@ -6099,6 +5723,13 @@ local function unload()
     end
 
     table.clear(Core.Instances)
+
+    pcall(function()
+        if Fluent and type(Fluent.Destroy) == "function" then
+            Fluent:Destroy()
+        end
+    end)
+
     ENV.__SON_HUB_UNLOAD = nil
 end
 
@@ -6118,7 +5749,7 @@ task.defer(function()
         or ""
 
     notify(
-        "SON HUB v6 Ready",
+        "SON HUB v8 Ready",
         prefix
             .. "Lv."
             .. tostring(PlayerState.GetLevel())
